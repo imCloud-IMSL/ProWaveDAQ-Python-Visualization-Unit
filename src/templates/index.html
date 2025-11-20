@@ -156,6 +156,55 @@
                 <label for="labelInput">資料標籤 (Label):</label>
                 <input type="text" id="labelInput" placeholder="請輸入資料標籤">
             </div>
+            
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="sqlEnabled" onchange="toggleSqlSettings()">
+                    啟用 SQL 伺服器上傳
+                </label>
+            </div>
+            
+            <div id="sqlSettings" style="display: none; padding: 15px; background-color: #f9f9f9; border-radius: 4px; margin-top: 10px;">
+                <h3 style="margin-top: 0;">SQL 伺服器設定</h3>
+                <div class="form-group">
+                    <label>
+                        <input type="radio" name="sqlConfigMode" id="sqlUseIni" value="ini" checked onchange="toggleSqlConfigMode()">
+                        使用 INI 檔案設定
+                    </label>
+                    <label style="margin-left: 20px;">
+                        <input type="radio" name="sqlConfigMode" id="sqlUseManual" value="manual" onchange="toggleSqlConfigMode()">
+                        手動輸入設定
+                    </label>
+                </div>
+                <div id="sqlIniInfo" style="padding: 10px; background-color: #e7f3ff; border-radius: 4px; margin-bottom: 10px;">
+                    <strong>使用 INI 檔案設定：</strong><br>
+                    <span id="sqlIniConfigText">載入中...</span><br>
+                    <small>可在「設定檔管理」頁面修改 Master.ini 中的 [SQLServer] 區段</small>
+                </div>
+                <div id="sqlManualSettings" style="display: none;">
+                    <div class="form-group">
+                        <label for="sqlHost">伺服器位置:</label>
+                        <input type="text" id="sqlHost" placeholder="localhost" value="localhost">
+                    </div>
+                    <div class="form-group">
+                        <label for="sqlPort">連接埠 (Port):</label>
+                        <input type="text" id="sqlPort" placeholder="3306" value="3306">
+                    </div>
+                    <div class="form-group">
+                        <label for="sqlUser">使用者名稱:</label>
+                        <input type="text" id="sqlUser" placeholder="root" value="root">
+                    </div>
+                    <div class="form-group">
+                        <label for="sqlPassword">密碼:</label>
+                        <input type="password" id="sqlPassword" placeholder="請輸入密碼">
+                    </div>
+                    <div class="form-group">
+                        <label for="sqlDatabase">資料庫名稱 (可選):</label>
+                        <input type="text" id="sqlDatabase" placeholder="prowavedaq" value="prowavedaq">
+                    </div>
+                </div>
+            </div>
+            
             <div class="form-group">
                 <button class="btn btn-start" id="startBtn" onclick="startCollection()">開始讀取</button>
                 <button class="btn btn-stop" id="stopBtn" onclick="stopCollection()" disabled>停止讀取</button>
@@ -291,6 +340,67 @@
                 });
         }
 
+        let sqlConfigFromIni = null;
+
+        // 載入 SQL 設定（從 INI 檔案）
+        function loadSqlConfig() {
+            fetch('/sql_config')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success && data.sql_config) {
+                        sqlConfigFromIni = data.sql_config;
+                        updateSqlIniInfo();
+                        
+                        // 如果 INI 設定啟用 SQL，自動勾選
+                        if (sqlConfigFromIni.enabled) {
+                            document.getElementById('sqlEnabled').checked = true;
+                            toggleSqlSettings();
+                        }
+                    }
+                })
+                .catch(error => {
+                    console.error('載入 SQL 設定時發生錯誤:', error);
+                });
+        }
+
+        // 更新 INI 設定顯示
+        function updateSqlIniInfo() {
+            if (!sqlConfigFromIni) return;
+            
+            const infoText = document.getElementById('sqlIniConfigText');
+            if (sqlConfigFromIni.enabled) {
+                infoText.innerHTML = `已啟用 | ${sqlConfigFromIni.host}:${sqlConfigFromIni.port} | 使用者: ${sqlConfigFromIni.user} | 資料庫: ${sqlConfigFromIni.database}`;
+            } else {
+                infoText.innerHTML = '未啟用（可在 INI 檔案中設定 enabled = true）';
+            }
+            
+            // 將 INI 設定值填入手動輸入欄位作為預設值
+            if (sqlConfigFromIni) {
+                document.getElementById('sqlHost').value = sqlConfigFromIni.host || 'localhost';
+                document.getElementById('sqlPort').value = sqlConfigFromIni.port || '3306';
+                document.getElementById('sqlUser').value = sqlConfigFromIni.user || 'root';
+                document.getElementById('sqlPassword').value = sqlConfigFromIni.password || '';
+                document.getElementById('sqlDatabase').value = sqlConfigFromIni.database || 'prowavedaq';
+            }
+        }
+
+        // 切換 SQL 設定顯示
+        function toggleSqlSettings() {
+            const sqlEnabled = document.getElementById('sqlEnabled').checked;
+            const sqlSettings = document.getElementById('sqlSettings');
+            sqlSettings.style.display = sqlEnabled ? 'block' : 'none';
+        }
+
+        // 切換 SQL 設定模式（INI 或手動）
+        function toggleSqlConfigMode() {
+            const useIni = document.getElementById('sqlUseIni').checked;
+            const iniInfo = document.getElementById('sqlIniInfo');
+            const manualSettings = document.getElementById('sqlManualSettings');
+            
+            iniInfo.style.display = useIni ? 'block' : 'none';
+            manualSettings.style.display = useIni ? 'none' : 'block';
+        }
+
         // 開始收集資料
         function startCollection() {
             const label = document.getElementById('labelInput').value.trim();
@@ -299,12 +409,38 @@
                 return;
             }
 
+            const sqlEnabled = document.getElementById('sqlEnabled').checked;
+            const requestData = {
+                label: label
+            };
+
+            // 如果啟用 SQL，根據模式決定是否傳送設定
+            if (sqlEnabled) {
+                const useIni = document.getElementById('sqlUseIni').checked;
+                
+                if (useIni) {
+                    // 使用 INI 設定：只傳送 sql_enabled，讓後端使用 INI 設定
+                    requestData.sql_enabled = true;
+                } else {
+                    // 手動輸入：傳送所有設定（覆蓋 INI 設定）
+                    requestData.sql_enabled = true;
+                    requestData.sql_host = document.getElementById('sqlHost').value.trim() || 'localhost';
+                    requestData.sql_port = document.getElementById('sqlPort').value.trim() || '3306';
+                    requestData.sql_user = document.getElementById('sqlUser').value.trim() || 'root';
+                    requestData.sql_password = document.getElementById('sqlPassword').value;
+                    requestData.sql_database = document.getElementById('sqlDatabase').value.trim() || 'prowavedaq';
+                }
+            } else {
+                // 未啟用 SQL
+                requestData.sql_enabled = false;
+            }
+
             fetch('/start', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ label: label })
+                body: JSON.stringify(requestData)
             })
                 .then(response => response.json())
                 .then(data => {
@@ -394,6 +530,8 @@
         // 初始化
         window.onload = function () {
             initChart();
+            // 載入 SQL 設定
+            loadSqlConfig();
             // 檢查並恢復狀態
             checkAndRestoreStatus();
             // 初始更新一次

@@ -25,25 +25,45 @@
             color: #333;
         }
 
+        h2 {
+            color: #555;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #ddd;
+        }
+
         .form-group {
-            margin-bottom: 20px;
+            margin-bottom: 15px;
         }
 
         label {
             display: block;
             margin-bottom: 5px;
             font-weight: bold;
+            color: #333;
         }
 
-        textarea {
+        input[type="text"],
+        input[type="number"],
+        input[type="password"],
+        input[type="checkbox"] {
             width: 100%;
-            min-height: 200px;
             padding: 8px;
             border: 1px solid #ddd;
             border-radius: 4px;
-            font-family: monospace;
-            font-size: 12px;
             box-sizing: border-box;
+            font-size: 14px;
+        }
+
+        input[type="checkbox"] {
+            width: auto;
+            margin-right: 5px;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
         }
 
         button {
@@ -87,6 +107,13 @@
         a:hover {
             text-decoration: underline;
         }
+
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background-color: #f9f9f9;
+            border-radius: 5px;
+        }
     </style>
 </head>
 
@@ -97,14 +124,69 @@
         <div id="statusArea"></div>
 
         <form id="configForm" onsubmit="saveConfig(event)">
-            <div class="form-group">
-                <label for="prodaq_content">ProWaveDAQ.ini:</label>
-                <textarea id="prodaq_content" name="prodaq_content" required>{{ prodaq_content }}</textarea>
+            <!-- ProWaveDAQ.ini 設定 -->
+            <div class="section">
+                <h2>ProWaveDAQ.ini</h2>
+                <div class="form-group">
+                    <label for="prodaq_serialPort">串列埠路徑 (serialPort):</label>
+                    <input type="text" id="prodaq_serialPort" name="prodaq_serialPort" value="{{ prodaq_data.serialPort }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="prodaq_baudRate">鮑率 (baudRate):</label>
+                    <input type="number" id="prodaq_baudRate" name="prodaq_baudRate" value="{{ prodaq_data.baudRate }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="prodaq_sampleRate">取樣率 (sampleRate):</label>
+                    <input type="number" id="prodaq_sampleRate" name="prodaq_sampleRate" value="{{ prodaq_data.sampleRate }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="prodaq_slaveID">從站 ID (slaveID):</label>
+                    <input type="number" id="prodaq_slaveID" name="prodaq_slaveID" value="{{ prodaq_data.slaveID }}" required>
+                </div>
             </div>
 
-            <div class="form-group">
-                <label for="master_content">Master.ini:</label>
-                <textarea id="master_content" name="master_content" required>{{ master_content }}</textarea>
+            <!-- Master.ini 設定 -->
+            <div class="section">
+                <h2>Master.ini</h2>
+                <div class="form-group">
+                    <label for="master_second">CSV 分檔間隔（秒）(second):</label>
+                    <input type="number" id="master_second" name="master_second" value="{{ master_data.second }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="master_sql_upload_interval">SQL 上傳間隔（秒）(sql_upload_interval):</label>
+                    <input type="number" id="master_sql_upload_interval" name="master_sql_upload_interval" value="{{ master_data.sql_upload_interval }}" required>
+                </div>
+            </div>
+
+            <!-- sql.ini 設定 -->
+            <div class="section">
+                <h2>sql.ini</h2>
+                <div class="form-group">
+                    <label class="checkbox-group">
+                        <input type="checkbox" id="sql_enabled" name="sql_enabled" value="true" {% if sql_data.enabled %}checked{% endif %}>
+                        啟用 SQL 上傳 (enabled)
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label for="sql_host">伺服器位置 (host):</label>
+                    <input type="text" id="sql_host" name="sql_host" value="{{ sql_data.host }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="sql_port">連接埠 (port):</label>
+                    <input type="number" id="sql_port" name="sql_port" value="{{ sql_data.port }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="sql_user">使用者名稱 (user):</label>
+                    <input type="text" id="sql_user" name="sql_user" value="{{ sql_data.user }}" required>
+                </div>
+                <div class="form-group">
+                    <label for="sql_password">密碼 (password):</label>
+                    <input type="password" id="sql_password" name="sql_password" value="{{ sql_data.password }}">
+                </div>
+                <div class="form-group">
+                    <label for="sql_database">資料庫名稱 (database):</label>
+                    <input type="text" id="sql_database" name="sql_database" value="{{ sql_data.database }}" required>
+                </div>
             </div>
 
             <button type="submit">儲存設定檔</button>
@@ -116,6 +198,11 @@
             event.preventDefault();
 
             const formData = new FormData(document.getElementById('configForm'));
+            
+            // 處理 checkbox（如果未勾選，不會被包含在 FormData 中）
+            if (!document.getElementById('sql_enabled').checked) {
+                formData.append('sql_enabled', 'false');
+            }
 
             fetch('/config', {
                 method: 'POST',
