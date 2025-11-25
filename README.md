@@ -137,23 +137,44 @@ CREATE TABLE IF NOT EXISTS vibration_data (
 
 ### 啟動系統
 
-執行主程式：
+#### 方式 1：使用啟動腳本（推薦）
+
+**使用預設 port 8080：**
+```bash
+./run.sh
+```
+
+**指定自訂 port：**
+```bash
+./run.sh 3000    # 使用 port 3000
+./run.sh 9000    # 使用 port 9000
+```
+
+**使用日誌記錄功能：**
+```bash
+./run_with_logs.sh          # 使用預設 port 8080，並保存日誌
+./run_with_logs.sh 3000     # 使用 port 3000，並保存日誌
+```
+
+#### 方式 2：直接執行 Python 程式
+
+**使用預設 port 8080：**
 ```bash
 cd src
 python3 main.py
 ```
 
-或直接執行：
+**指定自訂 port：**
 ```bash
 cd src
-./main.py
+python3 main.py --port 3000    # 使用 port 3000
+python3 main.py -p 9000        # 使用 port 9000（簡短形式）
 ```
 
-或是執行：
+**查看所有可用選項：**
 ```bash
-./run.sh
+python3 src/main.py --help
 ```
-直接進入虛擬環境並啟動程式
 
 啟動成功後，您會看到類似以下的訊息：
 ```
@@ -168,8 +189,12 @@ Press Ctrl+C to stop the server
 ### 使用 Web 介面
 
 1. **開啟瀏覽器**
-   - 在本地機器：開啟 `http://localhost:8080/`
-   - 在遠端機器：開啟 `http://<設備IP>:8080/`
+   - 在本地機器：開啟 `http://localhost:<port>/`（預設為 8080）
+   - 在遠端機器：開啟 `http://<設備IP>:<port>/`（預設為 8080）
+
+   **範例：**
+   - 使用預設 port：`http://localhost:8080/`
+   - 使用自訂 port 3000：`http://localhost:3000/`
 
 2. **輸入資料標籤**
    - 在「資料標籤 (Label)」欄位輸入本次測量的標籤名稱
@@ -579,8 +604,9 @@ function updateChart() {
 **症狀**：無法在瀏覽器中開啟網頁
 
 **解決方法**：
-- 確認防火牆允許 8080 埠
-- 檢查是否有其他程式佔用 8080 埠
+- 確認防火牆允許使用的埠號（預設為 8080）
+- 檢查是否有其他程式佔用該埠號
+- 如果使用自訂 port，請確認瀏覽器中的 URL 使用正確的埠號
 - 確認 Python 程式正在執行
 - 檢查系統日誌是否有錯誤訊息
 
@@ -854,6 +880,13 @@ collection_loop() [背景執行緒]
 如有問題或建議，請聯絡專案維護者。
 
 ## 更新日誌
+
+### Version 2.3.0
+- **新增**：支援啟動時指定 port
+  - 可透過命令行參數 `--port` 或 `-p` 指定 Flask 伺服器埠號
+  - 啟動腳本 `run.sh` 和 `run_with_logs.sh` 支援傳遞 port 參數
+  - 預設 port 仍為 8080，向後相容
+  - 自動驗證 port 範圍（1-65535）
 
 ### Version 2.2.0
 - **重構**：`prowavedaq.py` 架構優化

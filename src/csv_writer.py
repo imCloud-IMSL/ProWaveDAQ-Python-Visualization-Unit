@@ -41,6 +41,7 @@ class CSVWriter:
         self.file_counter = 1
         self.current_file = None
         self.writer = None
+        self.current_filename = None  # 當前檔名（不含路徑和 .csv 後綴）
         # 追蹤全局起始時間和已寫入的樣本總數（確保分檔時時間戳記連續）
         self.global_start_time = datetime.now()
         self.global_sample_count = 0
@@ -59,6 +60,9 @@ class CSVWriter:
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         filename = f"{timestamp}_{self.label}_{self.file_counter:03d}.csv"
         filepath = os.path.join(self.output_dir, filename)
+        
+        # 儲存當前檔名（不含路徑和 .csv 後綴），用於 SQL 表名
+        self.current_filename = f"{timestamp}_{self.label}_{self.file_counter:03d}"
 
         try:
             self.current_file = open(
@@ -75,6 +79,17 @@ class CSVWriter:
 
         except Exception as e:
             error(f"Error creating CSV file: {e}")
+    
+    def get_current_filename(self) -> str:
+        """
+        取得當前檔名（不含路徑和 .csv 後綴）
+        
+        此檔名可用於 SQL 表名，格式與 CSV 檔名一致。
+        
+        Returns:
+            str: 當前檔名，例如 "20251124232158_ThisIsMe_001"
+        """
+        return self.current_filename if self.current_filename else ""
 
     def add_data_block(self, data: List[float]) -> None:
         """

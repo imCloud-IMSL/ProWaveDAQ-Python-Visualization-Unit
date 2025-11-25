@@ -11,6 +11,7 @@ import time
 import threading
 import configparser
 import logging
+import argparse
 from datetime import datetime
 from typing import List, Optional, Dict
 from flask import Flask, render_template, request, jsonify, send_from_directory
@@ -398,8 +399,15 @@ def start_collection():
         if sql_enabled:
             try:
                 sql_uploader_instance = SQLUploader(channels, label, sql_config)
-                if not sql_uploader_instance.is_connected:
-                    return jsonify({'success': False, 'message': 'SQL 伺服器連線失敗，請檢查設定'})
+                # 注意：不再在初始化時建立固定表，改為在 CSV 分檔時動態建立
+                # 建立第一個表（對應第一個 CSV 檔案）
+                if csv_writer_instance:
+                    first_csv_filename = csv_writer_instance.get_current_filename()
+                    if first_csv_filename:
+                        if sql_uploader_instance.create_table(first_csv_filename):
+                            info(f"SQL 第一個表已建立，對應 CSV: {first_csv_filename}")
+                        else:
+                            warning(f"SQL 第一個表建立失敗，對應 CSV: {first_csv_filename}")
             except Exception as e:
                 return jsonify({'success': False, 'message': f'SQL 上傳器初始化失敗: {str(e)}'})
 
@@ -465,9 +473,19 @@ def stop_collection():
                     sql_data_buffer.extend(remaining_data)
                 
                 # 上傳緩衝區中所有剩餘資料（即使未達到門檻）
+                # 注意：如果當前沒有表，需要先建立表（對應最後一個 CSV 檔案）
                 if sql_data_buffer:
-                    sql_uploader_instance.add_data_block(sql_data_buffer)
-                    info(f"已上傳剩餘資料至 SQL 伺服器: {len(sql_data_buffer)} 個資料點")
+                    # 確保有對應的表（如果 CSV 有檔案，使用最後一個檔名）
+                    if csv_writer_instance and not sql_uploader_instance.current_table_name:
+                        last_csv_filename = csv_writer_instance.get_current_filename()
+                        if last_csv_filename:
+                            sql_uploader_instance.create_table(last_csv_filename)
+                    
+                    if sql_uploader_instance.current_table_name:
+                        sql_uploader_instance.add_data_block(sql_data_buffer)
+                        info(f"已上傳剩餘資料至 SQL 伺服器 (表: {sql_uploader_instance.current_table_name}): {len(sql_data_buffer)} 個資料點")
+                    else:
+                        warning("無法上傳剩餘資料：SQL 表未建立")
                     sql_data_buffer = []
                     sql_current_data_size = 0
             except Exception as e:
@@ -647,6 +665,16 @@ def collection_loop():
 
                             # 每個完整批次後更新檔案名稱（建立新檔案）
                             csv_writer_instance.update_filename()
+                            
+                            # ========== SQL 同步分檔：建立新表 ==========
+                            # 當 CSV 分檔時，SQL 也要建立對應的新表
+                            if sql_uploader_instance and sql_enabled:
+                                csv_filename = csv_writer_instance.get_current_filename()
+                                if csv_filename:
+                                    if sql_uploader_instance.create_table(csv_filename):
+                                        info(f"SQL 表已建立，對應 CSV: {csv_filename}")
+                                    else:
+                                        warning(f"SQL 表建立失敗，對應 CSV: {csv_filename}")
 
                             # 更新累積資料大小
                             current_data_size -= target_size
@@ -750,26 +778,57 @@ def collection_loop():
             time.sleep(0.1)  # 發生錯誤時等待 100ms 後繼續
 
 
-def run_flask_server():
-    """在獨立執行緒中執行 Flask 伺服器"""
+def run_flask_server(port: int = 8080):
+    """
+    在獨立執行緒中執行 Flask 伺服器
+    
+    Args:
+        port: Flask 伺服器監聽的埠號（預設為 8080）
+    """
     # 確保在啟動前禁用 HTTP 請求日誌
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     
-    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 
 def main():
     """主函數"""
+    # ========== 解析命令行參數 ==========
+    parser = argparse.ArgumentParser(
+        description='ProWaveDAQ Real-time Data Visualization System',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+範例：
+  python src/main.py              # 使用預設 port 8080
+  python src/main.py --port 3000  # 使用自訂 port 3000
+  python src/main.py -p 9000       # 使用自訂 port 9000
+        """
+    )
+    parser.add_argument(
+        '-p', '--port',
+        type=int,
+        default=8080,
+        help='Flask 伺服器監聽的埠號（預設: 8080）'
+    )
+    
+    args = parser.parse_args()
+    port = args.port
+    
+    # 驗證 port 範圍（1-65535）
+    if not (1 <= port <= 65535):
+        error(f"無效的埠號: {port}，請使用 1-65535 之間的數字")
+        sys.exit(1)
+    
     info("=" * 60)
     info("ProWaveDAQ Real-time Data Visualization System")
     info("=" * 60)
-    info("Web interface will be available at http://0.0.0.0:8080/")
+    info(f"Web interface will be available at http://0.0.0.0:{port}/")
     info("Press Ctrl+C to stop the server")
     info("=" * 60)
 
-    # 在背景執行緒中啟動 Flask 伺服器
-    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
+    # 在背景執行緒中啟動 Flask 伺服器（使用指定的 port）
+    flask_thread = threading.Thread(target=run_flask_server, args=(port,), daemon=True)
     flask_thread.start()
 
     # 等待使用者中斷
