@@ -669,7 +669,38 @@ function updateChart() {
 | 主執行緒 | 控制流程、等待使用者中斷 | 同步主控核心 |
 | Flask Thread | 提供 HTTP 介面與 API | daemon=True |
 | Collection Thread | 資料收集迴圈（處理 CSV 和 SQL） | 在 `/start` 時啟動 |
-| DAQ Reading Thread | 從 Modbus 設備讀取資料 | 在 `start_reading()` 時啟動 |
+| DAQ Reading Thread | 從 Modbus 設備讀取資料 | 在 `start_reading()` 時啟動，執行 `_read_loop()`
+
+### 程式碼架構
+
+#### `prowavedaq.py` 模組結構
+
+**公開 API（供外部使用）：**
+- `scan_devices()` - 掃描可用的 Modbus 設備
+- `init_devices(filename)` - 從 INI 檔案初始化設備並建立連線
+- `start_reading()` - 啟動資料讀取（背景執行緒）
+- `stop_reading()` - 停止資料讀取並關閉連線
+- `get_data()` - 非阻塞取得最新一批資料
+- `get_data_blocking(timeout)` - 阻塞取得最新一批資料
+- `get_counter()` - 取得讀取批次計數
+- `get_sample_rate()` - 取得取樣率
+
+**內部方法（模組內部使用）：**
+- `_connect()` - 建立 Modbus RTU 連線
+- `_disconnect()` - 關閉 Modbus 連線
+- `_ensure_connected()` - 確保連線存在（自動重連）
+- `_read_chip_id()` - 讀取晶片 ID（初始化時）
+- `_set_sample_rate()` - 設定取樣率（初始化時）
+- `_read_fifo_length()` - 讀取 FIFO 長度（寄存器 0x02）
+- `_read_raw_block(data_len)` - 讀取原始資料（寄存器 0x03）
+- `_convert_raw_to_float_samples(raw_block)` - 轉換為浮點數（確保 XYZ 不錯位）
+- `_read_loop()` - 主要讀取迴圈（背景執行緒）
+
+**設計原則：**
+- 每次讀取只處理完整的 XYZ 三軸組，避免通道錯位
+- 不跨批拼接 raw data，確保資料完整性
+- 自動重連機制，確保連線穩定性
+- 模組化設計，方便未來擴展和維護
 
 ### 資料流詳細說明
 
@@ -677,6 +708,9 @@ function updateChart() {
 ProWaveDAQ 設備
     ↓ (Modbus RTU)
 ProWaveDAQ._read_loop() [背景執行緒]
+    ├─ _read_fifo_length()      # 讀取 FIFO 長度（寄存器 0x02）
+    ├─ _read_raw_block()         # 讀取原始資料（寄存器 0x03）
+    └─ _convert_raw_to_float_samples()  # 轉換為浮點數（確保 XYZ 不錯位）
     ↓ (放入佇列)
 data_queue (queue.Queue, 最大 1000 筆)
     ↓
@@ -821,6 +855,24 @@ collection_loop() [背景執行緒]
 
 ## 更新日誌
 
+### Version 2.2.0
+- **重構**：`prowavedaq.py` 架構優化
+  - 重新組織程式碼結構，明確區分公開 API 和內部方法
+  - 簡化讀取邏輯，移除 `remaining_data` 機制（每次讀取都是完整批次）
+  - 改進 Modbus 連線管理（`_connect`、`_disconnect`、`_ensure_connected`）
+  - 新增 Modbus 寄存器常數定義（`REG_SAMPLE_RATE`、`REG_FIFO_LEN` 等）
+  - 模組化讀取流程（`_read_fifo_length`、`_read_raw_block`、`_convert_raw_to_float_samples`）
+  - 改進錯誤處理和重連邏輯
+  - 確保每次讀取只處理完整的 XYZ 三軸組，避免通道錯位
+- **改進**：程式碼註解
+  - 為所有核心模組添加詳細的中文註解
+  - 說明函數用途、參數、返回值、注意事項
+  - 解釋關鍵設計決策和資料流程
+  - 提升程式碼可讀性和可維護性
+- **改進**：日誌系統
+  - 統一 Debug 訊息標籤為 `[DEBUG]`（與其他級別一致）
+  - 改進日誌輸出格式的一致性
+
 ### Version 2.1.0
 - **新增**：統一日誌系統 (`logger.py`)
   - 提供統一的日誌格式：`[YYYY-MM-DD HH:MM:SS] [LEVEL] 訊息`
@@ -889,4 +941,4 @@ collection_loop() [背景執行緒]
 
 **最後更新**：2025年11月24日  
 **作者**：王建葦  
-**當前版本**：2.1.0
+**當前版本**：2.2.0
