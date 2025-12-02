@@ -717,14 +717,21 @@ function updateChart() {
 - `_ensure_connected()` - 確保連線存在（自動重連）
 - `_read_chip_id()` - 讀取晶片 ID（初始化時）
 - `_set_sample_rate()` - 設定取樣率（初始化時）
-- `_read_fifo_length()` - 讀取 FIFO 長度（寄存器 0x02）
-- `_read_raw_block(data_len)` - 讀取原始資料（寄存器 0x03）
-- `_convert_raw_to_float_samples(raw_block)` - 轉換為浮點數（確保 XYZ 不錯位）
+- `_read_registers_with_header()` - 讀取寄存器（包含 Header）
+- `_read_normal_data()` - Normal Mode 讀取（Address 0x02）
+- `_read_bulk_data()` - Bulk Mode 讀取（Address 0x15）
+- `_get_buffer_status()` - 讀取緩衝區狀態
+- `_convert_raw_to_float_samples()` - 轉換為浮點數（確保 XYZ 不錯位）
 - `_read_loop()` - 主要讀取迴圈（背景執行緒）
+
+**讀取模式：**
+- **Normal Mode**：當緩衝區資料量 ≤ 123 時使用，從 Address 0x02 讀取
+- **Bulk Mode**：當緩衝區資料量 > 123 時使用，從 Address 0x15 讀取，最多讀取 9 個樣本
+- 自動根據緩衝區狀態切換模式，優化讀取效率
 
 **設計原則：**
 - 每次讀取只處理完整的 XYZ 三軸組，避免通道錯位
-- 不跨批拼接 raw data，確保資料完整性
+- FIFO buffer size(0x02) 連同資料一起讀出，確保一致性
 - 自動重連機制，確保連線穩定性
 - 模組化設計，方便未來擴展和維護
 
@@ -734,20 +741,24 @@ function updateChart() {
 ProWaveDAQ 設備
     ↓ (Modbus RTU)
 ProWaveDAQ._read_loop() [背景執行緒]
-    ├─ _read_fifo_length()      # 讀取 FIFO 長度（寄存器 0x02）
-    ├─ _read_raw_block()         # 讀取原始資料（寄存器 0x03）
+    ├─ _get_buffer_status()      # 讀取緩衝區狀態（寄存器 0x02）
+    ├─ 模式判斷
+    │   ├─ buffer_count ≤ 123 → Normal Mode
+    │   │   └─ _read_normal_data()  # 從 Address 0x02 讀取
+    │   └─ buffer_count > 123 → Bulk Mode
+    │       └─ _read_bulk_data()     # 從 Address 0x15 讀取（最多 9 個樣本）
+    ├─ _read_registers_with_header() # 讀取 Header + 資料
     └─ _convert_raw_to_float_samples()  # 轉換為浮點數（確保 XYZ 不錯位）
     ↓ (放入佇列)
-data_queue (queue.Queue, 最大 1000 筆)
+data_queue (queue.Queue, 最大 10000 筆)
     ↓
 collection_loop() [背景執行緒]
     │
     ├─→ update_realtime_data()
     │   │
     │   ▼
-    │   realtime_data (List[float], 最多 10000 點)
+    │   realtime_data (List[float], 無限制)
     │   │   - 智慧緩衝區：僅在有活躍連線時更新
-    │   │   - 記憶體管理：超過 10000 點時只保留最近 10000 點
     │   │
     │   ▼
     │   Flask /data API (HTTP GET, 每 200ms)
@@ -881,6 +892,29 @@ collection_loop() [背景執行緒]
 
 ## 更新日誌
 
+### Version 3.0.0
+- **重大更新**：重構資料讀取邏輯
+  - 實現 Normal Mode 和 Bulk Mode 自動切換機制
+  - 根據緩衝區狀態（buffer_count）動態選擇讀取模式
+  - Normal Mode：當 buffer_count ≤ 123 時，從 Address 0x02 讀取
+  - Bulk Mode：當 buffer_count > 123 時，從 Address 0x15 讀取（最多 9 個樣本）
+  - FIFO buffer size(0x02) 連同資料一起讀出，確保資料一致性
+- **改進**：讀取效率優化
+  - 一次讀取 Header 和資料，減少 Modbus 通訊次數
+  - 使用 `_read_registers_with_header()` 方法統一處理讀取邏輯
+  - 參考 LabView 轉換版本（G.py）的實現方式
+- **改進**：程式碼清理
+  - 移除所有冗餘註解和步驟標記
+  - 簡化程式碼結構，提升可讀性
+  - 移除不再使用的舊方法（`_read_fifo_length`、`_read_raw_block` 等）
+- **改進**：即時資料顯示
+  - 移除資料點數限制（原本限制 100000 個資料點）
+  - 現在會保留並顯示所有資料
+- **改進**：文件更新
+  - 更新 README.md 和 程式運作說明.md
+  - 詳細說明 Normal Mode 和 Bulk Mode 的運作方式
+  - 更新資料流程圖和架構說明
+
 ### Version 2.3.0
 - **新增**：支援啟動時指定 port
   - 可透過命令行參數 `--port` 或 `-p` 指定 Flask 伺服器埠號
@@ -972,6 +1006,6 @@ collection_loop() [背景執行緒]
 
 ---
 
-**最後更新**：2025年11月24日  
+**最後更新**：2025年12月03日
 **作者**：王建葦  
-**當前版本**：2.2.0
+**當前版本**：3.0.0

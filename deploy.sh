@@ -24,8 +24,8 @@ echo ""
 echo -e "${YELLOW}[1/6] Checking and installing Python packages...${NC}"
 
 # Check if Debian/Ubuntu system
-apt-get update && apt-get upgrade -y
-apt-get install -y python3 python3-pip python3-venv
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y python3 python3-pip python3-venv
 
 PYTHON_VERSION=$(python3 --version | awk '{print $2}')
 echo -e "${GREEN}Python version: $PYTHON_VERSION${NC}"
@@ -35,7 +35,7 @@ echo ""
 echo -e "${YELLOW}[2/6] Setting up Python virtual environment...${NC}"
 if [ -d "venv" ]; then
     echo "Removing existing virtual environment..."
-    rm -rf venv
+    sudo rm -rf venv
     echo -e "${GREEN} Old virtual environment removed${NC}"
 fi
 echo "Creating virtual environment..."

@@ -3,6 +3,8 @@
 """
 ProWaveDAQ 即時資料可視化系統 - 主控制程式
 整合 DAQ、Web、CSV 三者運作
+
+版本：3.0.0
 """
 
 import os
@@ -19,31 +21,24 @@ from prowavedaq import ProWaveDAQ
 from csv_writer import CSVWriter
 from sql_uploader import SQLUploader
 
-# 導入統一日誌系統
 try:
     from logger import info, debug, error, warning
 except ImportError:
-    # 如果無法導入，使用簡單的 fallback
     def info(msg): print(f"[INFO] {msg}")
     def debug(msg): print(f"[Debug] {msg}")
     def error(msg): print(f"[Error] {msg}")
     def warning(msg): print(f"[Warning] {msg}")
 
-# 設定工作目錄為專案根目錄（src 的上一層）
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 os.chdir(PROJECT_ROOT)
 
-# 將 src 資料夾添加到 Python 路徑，以便導入模組
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-# 全域狀態變數（用於記憶體中資料傳遞）
 app = Flask(__name__, template_folder='templates')
-
-# 禁用 Flask/Werkzeug 的 HTTP 請求日誌
 log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)  # 只顯示錯誤，隱藏 HTTP 請求日誌
+log.setLevel(logging.ERROR)
 realtime_data: List[float] = []
 data_lock = threading.Lock()
 is_collecting = False
@@ -56,32 +51,25 @@ target_size = 0
 current_data_size = 0
 sql_target_size = 0
 sql_current_data_size = 0
-sql_data_buffer: List[float] = []  # SQL 資料緩衝區
-sql_buffer_max_size = 0  # SQL 緩衝區最大大小（防止記憶體溢出）
+sql_data_buffer: List[float] = []
+sql_buffer_max_size = 0
 sql_enabled = False
 sql_config: Dict[str, str] = {}
-# 追蹤是否有活躍的前端連線（用於優化：無連線時不更新即時資料緩衝區）
 last_data_request_time = 0
 data_request_lock = threading.Lock()
-DATA_REQUEST_TIMEOUT = 5.0  # 5 秒內沒有請求視為無活躍連線
+DATA_REQUEST_TIMEOUT = 5.0
 
 
 def update_realtime_data(data: List[float]) -> None:
     """更新即時資料（供前端顯示）"""
     global realtime_data, data_counter, last_data_request_time
     
-    # 檢查是否有活躍的前端連線
     with data_request_lock:
         has_active_connection = (time.time() - last_data_request_time) < DATA_REQUEST_TIMEOUT
     
-    # 只有在有活躍連線時才更新即時資料緩衝區
-    # 但始終更新計數器（用於狀態顯示）
     with data_lock:
         if has_active_connection:
             realtime_data.extend(data)
-            # 限制記憶體使用，保留最近 10000 個資料點
-            if len(realtime_data) > 10000:
-                realtime_data = realtime_data[-10000:]
         data_counter += len(data)
 
 
@@ -300,14 +288,12 @@ def start_collection():
         if not label:
             return jsonify({'success': False, 'message': '請提供資料標籤'})
 
-        # 重置狀態
         with data_lock:
             realtime_data = []
             data_counter = 0
             current_data_size = 0
             sql_current_data_size = 0
             sql_data_buffer = []
-        # 重置請求時間追蹤
         with data_request_lock:
             global last_data_request_time
             last_data_request_time = 0
@@ -394,13 +380,10 @@ def start_collection():
         # 初始化 CSV Writer（傳入取樣率以正確計算時間戳記）
         csv_writer_instance = CSVWriter(channels, output_path, label, sample_rate)
 
-        # 初始化 SQL Uploader（如果啟用）
         sql_uploader_instance = None
         if sql_enabled:
             try:
                 sql_uploader_instance = SQLUploader(channels, label, sql_config)
-                # 注意：不再在初始化時建立固定表，改為在 CSV 分檔時動態建立
-                # 建立第一個表（對應第一個 CSV 檔案）
                 if csv_writer_instance:
                     first_csv_filename = csv_writer_instance.get_current_filename()
                     if first_csv_filename:
@@ -446,36 +429,25 @@ def stop_collection():
         if daq_instance:
             daq_instance.stop_reading()
 
-        # 等待 collection_loop 完成當前處理（給一點時間讓迴圈處理完剩餘資料）
         time.sleep(0.1)
         
-        # 處理剩餘資料
-        # CSV 的剩餘資料會保留在檔案中，不需要特別處理
-        
-        # 處理 SQL 剩餘資料（如果啟用且有剩餘資料）
         if sql_uploader_instance and sql_enabled:
             try:
-                # 從 DAQ 取得所有剩餘資料（如果 DAQ 還在運行）
                 remaining_data = []
                 if daq_instance:
-                    # 嘗試取得佇列中剩餘的資料
                     max_attempts = 10
                     for _ in range(max_attempts):
                         data = daq_instance.get_data()
                         if not data or len(data) == 0:
                             break
                         remaining_data.extend(data)
-                        time.sleep(0.01)  # 短暫等待
+                        time.sleep(0.01)
                 
-                # 將剩餘資料加入緩衝區
                 global sql_data_buffer
                 if remaining_data:
                     sql_data_buffer.extend(remaining_data)
                 
-                # 上傳緩衝區中所有剩餘資料（即使未達到門檻）
-                # 注意：如果當前沒有表，需要先建立表（對應最後一個 CSV 檔案）
                 if sql_data_buffer:
-                    # 確保有對應的表（如果 CSV 有檔案，使用最後一個檔名）
                     if csv_writer_instance and not sql_uploader_instance.current_table_name:
                         last_csv_filename = csv_writer_instance.get_current_filename()
                         if last_csv_filename:
@@ -491,11 +463,9 @@ def stop_collection():
             except Exception as e:
                 error(f"上傳剩餘資料至 SQL 伺服器時發生錯誤: {e}")
 
-        # 關閉 CSV Writer
         if csv_writer_instance:
             csv_writer_instance.close()
 
-        # 關閉 SQL Uploader
         if sql_uploader_instance:
             sql_uploader_instance.close()
 
@@ -627,47 +597,28 @@ def collection_loop():
 
     while is_collecting:
         try:
-            # ========== 步驟 1：從 DAQ 取得資料（非阻塞） ==========
             data = daq_instance.get_data()
 
-            # ========== 步驟 2：持續處理佇列中的所有資料 ==========
-            # 使用 while 迴圈確保處理完所有可用的資料
             while data and len(data) > 0:
-                # 保存原始資料副本（用於 SQL 上傳，避免與 CSV 處理衝突）
                 original_data = data.copy()
                 data_size = len(data)
 
-                # ========== 步驟 3：更新即時顯示緩衝區 ==========
                 update_realtime_data(data)
-
-                # ========== 步驟 4：寫入 CSV 檔案（自動分檔） ==========
                 if csv_writer_instance:
                     current_data_size += data_size
 
                     if current_data_size < target_size:
-                        # 資料還未達到分檔門檻，直接寫入當前檔案
                         csv_writer_instance.add_data_block(data)
                     else:
-                        # 需要分檔處理（達到或超過目標大小）
-                        data_actual_size = data_size  # 保存實際資料大小（防止誤用 current_data_size）
-                        # 計算當前檔案還剩多少空間
+                        data_actual_size = data_size
                         empty_space = target_size - (current_data_size - data_actual_size)
-
-                        # 確保切斷位置在樣本邊界（3的倍數）
-                        # 向下取整到最近的樣本邊界，避免部分樣本被切斷
                         empty_space = (empty_space // channels) * channels
 
-                        # 如果累積資料達到或超過目標大小，將資料分批處理
                         while current_data_size >= target_size:
-                            # 取出要寫入當前檔案的資料批次
                             batch = data[:empty_space]
                             csv_writer_instance.add_data_block(batch)
-
-                            # 每個完整批次後更新檔案名稱（建立新檔案）
                             csv_writer_instance.update_filename()
                             
-                            # ========== SQL 同步分檔：建立新表 ==========
-                            # 當 CSV 分檔時，SQL 也要建立對應的新表
                             if sql_uploader_instance and sql_enabled:
                                 csv_filename = csv_writer_instance.get_current_filename()
                                 if csv_filename:
@@ -676,100 +627,65 @@ def collection_loop():
                                     else:
                                         warning(f"SQL 表建立失敗，對應 CSV: {csv_filename}")
 
-                            # 更新累積資料大小
                             current_data_size -= target_size
                             
-                            # 更新 data 和 empty_space 用於下一批次
                             if empty_space < data_actual_size:
-                                # 還有剩餘資料，繼續處理
                                 data = data[empty_space:]
                                 data_actual_size = len(data)
                                 empty_space = target_size
-                                # 再次確保切斷位置在樣本邊界
                                 empty_space = (empty_space // channels) * channels
                             else:
-                                # 所有資料都已處理完畢
                                 break
 
-                        # 處理剩餘資料（少於 target_size 的部分）
                         pending = data_actual_size
                         if pending:
-                            # 將剩餘資料寫入新檔案（作為下一檔案的開頭）
                             csv_writer_instance.add_data_block(data)
                             current_data_size = pending
                         else:
                             current_data_size = 0
-
-                # ========== 步驟 5：上傳至 SQL 伺服器（如果啟用） ==========
-                # 注意：SQL 上傳使用原始資料的副本，與 CSV 分檔邏輯完全獨立
-                # 邏輯與 CSV 相同：累積資料到緩衝區，達到門檻才上傳
                 if sql_uploader_instance and sql_enabled:
-                    sql_data = original_data.copy()  # 使用原始資料副本（避免與 CSV 處理衝突）
+                    sql_data = original_data.copy()
                     sql_data_size = len(sql_data)
                     
-                    # 將資料加入 SQL 緩衝區
                     global sql_data_buffer, sql_buffer_max_size
                     sql_data_buffer.extend(sql_data)
                     sql_current_data_size += sql_data_size
 
-                    # ========== 記憶體保護機制 ==========
-                    # 如果緩衝區超過最大大小，強制上傳部分資料（防止記憶體溢出）
                     while len(sql_data_buffer) > sql_buffer_max_size:
-                        # 計算要上傳的資料量（至少上傳一個 sql_target_size）
                         upload_size = min(sql_target_size, len(sql_data_buffer))
-                        # 確保上傳大小是3的倍數（樣本邊界）
                         upload_size = (upload_size // channels) * channels
                         if upload_size == 0:
-                            # 如果計算結果為 0，至少上傳 3 個樣本
                             upload_size = min(channels * 3, len(sql_data_buffer))
                             upload_size = (upload_size // channels) * channels
                         
-                        # 從緩衝區取出要上傳的資料（不立即移除，等上傳成功後才移除）
                         sql_batch = sql_data_buffer[:upload_size]
                         
-                        # 嘗試上傳，只有成功才從緩衝區移除
                         if sql_uploader_instance.add_data_block(sql_batch):
-                            # 上傳成功，從緩衝區移除已上傳的資料
                             sql_data_buffer = sql_data_buffer[upload_size:]
                             sql_current_data_size -= upload_size
                             info(f"SQL 緩衝區超過上限，已成功上傳 {upload_size} 個資料點")
                         else:
-                            # 上傳失敗，保留資料在緩衝區，等待下次重試
                             warning(f"SQL 上傳失敗，保留 {upload_size} 個資料點在緩衝區，等待重試")
-                            # 如果持續失敗，為了防止記憶體溢出，跳過此次上傳
-                            # 但資料仍保留在緩衝區，下次達到門檻時會再次嘗試
                             break
 
-                    # ========== 正常上傳邏輯 ==========
-                    # 如果累積資料達到或超過門檻，進行上傳
                     while sql_current_data_size >= sql_target_size and len(sql_data_buffer) > 0:
-                        # 計算要上傳的資料量
                         upload_size = min(sql_target_size, len(sql_data_buffer))
-                        # 確保上傳大小是3的倍數（樣本邊界）
                         upload_size = (upload_size // channels) * channels
                         if upload_size == 0:
-                            # 如果計算結果為 0，至少上傳 3 個樣本
                             upload_size = min(channels * 3, len(sql_data_buffer))
                             upload_size = (upload_size // channels) * channels
                         
-                        # 從緩衝區取出要上傳的資料（不立即移除，等上傳成功後才移除）
                         sql_batch = sql_data_buffer[:upload_size]
                         
-                        # 嘗試上傳，只有成功才從緩衝區移除
                         if sql_uploader_instance.add_data_block(sql_batch):
-                            # 上傳成功，從緩衝區移除已上傳的資料
                             sql_data_buffer = sql_data_buffer[upload_size:]
                             sql_current_data_size -= upload_size
                         else:
-                            # 上傳失敗，保留資料在緩衝區，等待下次重試
                             warning(f"SQL 上傳失敗，保留 {upload_size} 個資料點在緩衝區，等待重試")
-                            # 跳出迴圈，等待下次資料進入時再次嘗試
                             break
 
-                # ========== 步驟 6：繼續從佇列取得下一筆資料 ==========
                 data = daq_instance.get_data()
 
-            # 短暫休息以避免 CPU 過載（10ms）
             time.sleep(0.01)
 
         except Exception as e:
