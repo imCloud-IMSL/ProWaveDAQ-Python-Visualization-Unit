@@ -350,7 +350,7 @@ class ProWaveDAQ:
         
         try:
             result = self.client.read_input_registers(
-                address=address, count=read_count, slave=self.slave_id
+                address=address, count=read_count
             )
             
             if result.isError() or len(result.registers) != read_count:
@@ -399,7 +399,7 @@ class ProWaveDAQ:
         
         try:
             result = self.client.read_input_registers(
-                address=self.REG_FIFO_LEN, count=1, slave=self.slave_id
+                address=self.REG_FIFO_LEN, count=1
             )
             if result.isError():
                 return 0
