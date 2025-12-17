@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CSV寫入器 - 用於將振動數據寫入CSV檔案
+CSV 寫入器模組
+
+此模組負責將振動數據寫入 CSV 檔案，支援：
+- 自動分檔（根據資料量）
+- 精確的時間戳記計算（根據取樣率）
+- 確保分檔時時間戳記連續
+- 多通道資料寫入（預設 3 通道：X, Y, Z）
+
+版本：4.0.0
 """
 
 import os
@@ -22,7 +30,17 @@ except ImportError:
 
 
 class CSVWriter:
-    """CSV寫入器類別"""
+    """
+    CSV 寫入器類別
+    
+    此類別負責將振動數據寫入 CSV 檔案，支援自動分檔和精確的時間戳記計算。
+    
+    使用方式：
+        writer = CSVWriter(channels=3, output_dir="./output", label="test", sample_rate=7812)
+        writer.add_data_block([x1, y1, z1, x2, y2, z2, ...])
+        writer.update_filename()  # 建立新檔案
+        writer.close()
+    """
 
     def __init__(self, channels: int, output_dir: str, label: str, sample_rate: int = 7812):
         """
@@ -41,27 +59,45 @@ class CSVWriter:
         self.file_counter = 1
         self.current_file = None
         self.writer = None
-        self.current_filename = None  # 當前檔名（不含路徑和 .csv 後綴）
-        # 追蹤全局起始時間和已寫入的樣本總數（確保分檔時時間戳記連續）
+        self.current_filename = None
         self.global_start_time = datetime.now()
         self.global_sample_count = 0
         self._create_output_directory()
         self._create_new_file()
 
     def _create_output_directory(self) -> None:
-        """建立輸出目錄"""
+        """
+        建立輸出目錄
+        
+        如果目錄不存在，會自動建立。如果目錄已存在，不會報錯。
+        
+        注意：
+            - 使用 exist_ok=True，避免目錄已存在時報錯
+            - 如果建立失敗，會輸出錯誤訊息但不會拋出例外
+        """
         try:
             os.makedirs(self.output_dir, exist_ok=True)
         except Exception as e:
             error(f"Error creating output directory: {e}")
 
     def _create_new_file(self) -> None:
-        """建立新的CSV檔案"""
+        """
+        建立新的 CSV 檔案
+        
+        此方法會建立一個新的 CSV 檔案，檔案命名格式為：
+        {timestamp}_{label}_{file_counter:03d}.csv
+        
+        檔案會包含標題行，並立即刷新到磁碟。
+        
+        注意：
+            - 檔案使用 UTF-8 編碼
+            - 檔名會儲存在 current_filename 中（不含路徑和 .csv 後綴），用於 SQL 表名
+            - 通道標示：Channel_1 = X, Channel_2 = Y, Channel_3 = Z
+        """
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         filename = f"{timestamp}_{self.label}_{self.file_counter:03d}.csv"
         filepath = os.path.join(self.output_dir, filename)
         
-        # 儲存當前檔名（不含路徑和 .csv 後綴），用於 SQL 表名
         self.current_filename = f"{timestamp}_{self.label}_{self.file_counter:03d}"
 
         try:
@@ -69,8 +105,6 @@ class CSVWriter:
                 filepath, 'w', newline='', encoding='utf-8')
             self.writer = csv.writer(self.current_file)
 
-            # 寫入標題行
-            # 通道對應：Channel_1 = X, Channel_2 = Y, Channel_3 = Z
             headers = ['Timestamp', 'Channel_1(X)', 'Channel_2(Y)', 'Channel_3(Z)']
             self.writer.writerow(headers)
             self.current_file.flush()
@@ -115,42 +149,38 @@ class CSVWriter:
             return
 
         try:
-            # ========== 計算每個樣本的時間間隔 ==========
-            # 取樣率是每秒的樣本數，每個樣本間隔 = 1 / sample_rate 秒
-            # 例如：取樣率 7812 Hz，每個樣本間隔 = 1/7812 ≈ 0.000128 秒
             sample_interval = 1.0 / self.sample_rate
 
-            # ========== 將數據按通道分組並寫入 CSV ==========
-            # 資料格式：[X1, Y1, Z1, X2, Y2, Z2, ...]
-            # 每 channels 個資料為一組（一個樣本）
             for i in range(0, len(data), self.channels):
-                # 計算當前樣本的時間戳記
-                # 從全局起始時間開始，根據全局樣本計數計算時間
-                # 這樣可以確保分檔時時間戳記連續（不會因為分檔而重置時間）
                 elapsed_time = self.global_sample_count * sample_interval
                 timestamp = self.global_start_time + timedelta(seconds=elapsed_time)
                 
-                # 建立 CSV 行：時間戳記 + 各通道資料
-                row = [timestamp.isoformat()]  # ISO 8601 格式的時間戳記
+                row = [timestamp.isoformat()]
                 for j in range(self.channels):
                     if i + j < len(data):
-                        row.append(data[i + j])  # 添加通道資料
+                        row.append(data[i + j])
                     else:
-                        row.append(0.0)  # 如果數據不足，填充 0.0
+                        row.append(0.0)
 
-                # 寫入 CSV 行
                 self.writer.writerow(row)
-                # 增加全局樣本計數（用於計算下一個樣本的時間戳記）
                 self.global_sample_count += 1
 
-            # 立即刷新檔案緩衝區，確保資料即時寫入磁碟
             self.current_file.flush()
 
         except Exception as e:
             error(f"Error writing CSV data: {e}")
 
     def update_filename(self) -> None:
-        """更新檔案名稱（建立新檔案）"""
+        """
+        更新檔案名稱（建立新檔案）
+        
+        此方法會關閉當前檔案，遞增檔案計數器，然後建立新檔案。
+        用於 CSV 分檔功能。
+        
+        注意：
+            - 檔案計數器會自動遞增（001, 002, 003, ...）
+            - 新檔案會使用相同的標籤和時間戳記格式
+        """
         if self.current_file:
             self.current_file.close()
 
@@ -158,12 +188,25 @@ class CSVWriter:
         self._create_new_file()
 
     def close(self) -> None:
-        """關閉CSV檔案"""
+        """
+        關閉 CSV 檔案
+        
+        此方法會關閉當前開啟的檔案並清理資源。
+        建議在完成所有寫入操作後呼叫此方法。
+        
+        注意：
+            - 如果檔案未開啟，此方法不會報錯
+            - 關閉後無法再寫入資料
+        """
         if self.current_file:
             self.current_file.close()
             self.current_file = None
             self.writer = None
 
     def __del__(self):
-        """解構函數"""
+        """
+        解構函數
+        
+        當物件被銷毀時自動關閉檔案，確保資源正確釋放。
+        """
         self.close()

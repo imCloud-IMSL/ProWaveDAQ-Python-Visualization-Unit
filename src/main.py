@@ -4,7 +4,7 @@
 ProWaveDAQ 即時資料可視化系統 - 主控制程式
 整合 DAQ、Web、CSV 三者運作
 
-版本：3.0.0
+版本：4.0.0
 """
 
 import os
@@ -61,7 +61,21 @@ DATA_REQUEST_TIMEOUT = 5.0
 
 
 def update_realtime_data(data: List[float]) -> None:
-    """更新即時資料（供前端顯示）"""
+    """
+    更新即時資料緩衝區（供前端顯示）
+    
+    此函數採用智慧緩衝區更新機制：
+    - 僅在有活躍前端連線時更新即時資料緩衝區，節省 CPU 和記憶體資源
+    - 無活躍連線時跳過緩衝區更新，但計數器仍正常更新
+    - 資料點計數器始終更新，用於狀態顯示
+    
+    Args:
+        data: 要添加的資料列表，格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
+    
+    注意：
+        - 使用執行緒鎖確保資料一致性
+        - 活躍連線判斷：5 秒內有 /data API 請求視為活躍
+    """
     global realtime_data, data_counter, last_data_request_time
     
     with data_request_lock:
@@ -74,7 +88,16 @@ def update_realtime_data(data: List[float]) -> None:
 
 
 def get_realtime_data() -> List[float]:
-    """取得即時資料的副本"""
+    """
+    取得即時資料的副本（供前端 API 使用）
+    
+    Returns:
+        List[float]: 即時資料的副本，格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
+    
+    注意：
+        - 返回副本以避免前端修改原始資料
+        - 使用執行緒鎖確保資料一致性
+    """
     with data_lock:
         return realtime_data.copy()
 
@@ -94,9 +117,23 @@ def files_page():
 
 @app.route('/data')
 def get_data():
-    """回傳目前最新資料 JSON 給前端"""
+    """
+    回傳目前最新資料 JSON 給前端
+    
+    此 API 端點用於前端輪詢取得即時資料（每 200ms 請求一次）。
+    同時會更新最後請求時間，用於判斷是否有活躍的前端連線。
+    
+    Returns:
+        JSON 回應，包含：
+        - success: 是否成功
+        - data: 即時資料列表，格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
+        - counter: 資料點計數器（總資料點數）
+    
+    注意：
+        - 前端會將資料按每 3 個一組分離為 X, Y, Z 三個通道
+        - 請求時間會用於智慧緩衝區更新機制
+    """
     global last_data_request_time
-    # 更新最後請求時間（表示有活躍的前端連線）
     with data_request_lock:
         last_data_request_time = time.time()
     
@@ -111,7 +148,22 @@ def get_data():
 
 @app.route('/status')
 def get_status():
-    """檢查資料收集狀態"""
+    """
+    檢查資料收集狀態（用於前端狀態恢復）
+    
+    當前端頁面載入時，會呼叫此 API 檢查後端狀態。
+    如果後端正在收集資料，前端會自動恢復狀態並開始更新圖表。
+    
+    Returns:
+        JSON 回應，包含：
+        - success: 是否成功
+        - is_collecting: 是否正在收集資料
+        - counter: 資料點計數器（總資料點數）
+    
+    使用場景：
+        - 頁面重新載入時恢復狀態
+        - 從其他頁面返回主頁時同步狀態
+    """
     global is_collecting, data_counter
     return jsonify({
         'success': True,
@@ -122,7 +174,27 @@ def get_status():
 
 @app.route('/sql_config')
 def get_sql_config():
-    """取得 SQL 設定（從 sql.ini）"""
+    """
+    取得 SQL 設定（從 sql.ini 檔案讀取）
+    
+    前端會使用此 API 讀取 SQL 設定，用於預填表單或判斷是否啟用 SQL 上傳。
+    
+    Returns:
+        JSON 回應，包含：
+        - success: 是否成功
+        - sql_config: SQL 設定字典，包含：
+            - enabled: 是否啟用 SQL 上傳
+            - host: SQL 伺服器位置
+            - port: 連接埠
+            - user: 使用者名稱
+            - password: 密碼
+            - database: 資料庫名稱
+        - message: 錯誤訊息（如果失敗）
+    
+    注意：
+        - 如果讀取失敗，返回預設設定（enabled=False）
+        - 密碼會以明文返回（前端需要顯示在表單中）
+    """
     try:
         ini_file_path = "API/sql.ini"
         config = configparser.ConfigParser()
@@ -166,14 +238,29 @@ def get_sql_config():
 
 @app.route('/config', methods=['GET', 'POST'])
 def config():
-    """顯示與修改 ProWaveDAQ.ini、Master.ini、sql.ini"""
+    """
+    顯示與修改設定檔（ProWaveDAQ.ini、Master.ini、sql.ini）
+    
+    GET 請求：
+        讀取三個設定檔的內容並顯示在編輯頁面（固定輸入框模式）。
+    
+    POST 請求：
+        接收表單資料並寫入三個設定檔。
+    
+    Returns:
+        GET: 渲染 config.html 模板，包含三個設定檔的內容
+        POST: JSON 回應，包含 success 和 message
+    
+    注意：
+        - 使用固定輸入框模式，防止使用者誤刪參數
+        - 所有設定檔使用 UTF-8 編碼
+    """
     ini_dir = "API"
     prodaq_ini = os.path.join(ini_dir, "ProWaveDAQ.ini")
     master_ini = os.path.join(ini_dir, "Master.ini")
     sql_ini = os.path.join(ini_dir, "sql.ini")
 
     if request.method == 'POST':
-        # 儲存設定檔
         try:
             # 讀取 ProWaveDAQ.ini 設定
             prodaq_config = configparser.ConfigParser()
@@ -223,7 +310,6 @@ def config():
             return jsonify({'success': False, 'message': str(e)})
 
     # GET 請求：讀取設定檔並顯示編輯頁面
-    # 讀取 ProWaveDAQ.ini
     prodaq_config = configparser.ConfigParser()
     try:
         prodaq_config.read(prodaq_ini, encoding='utf-8')
@@ -273,7 +359,34 @@ def config():
 
 @app.route('/start', methods=['POST'])
 def start_collection():
-    """啟動 DAQ、CSVWriter、SQLUploader 與即時顯示"""
+    """
+    啟動資料收集（DAQ、CSVWriter、SQLUploader 與即時顯示）
+    
+    此函數會：
+    1. 驗證請求參數（label 必須提供）
+    2. 載入設定檔（Master.ini、ProWaveDAQ.ini、sql.ini）
+    3. 初始化 DAQ 設備並建立 Modbus 連線
+    4. 計算 CSV 分檔和 SQL 上傳的目標大小
+    5. 建立輸出目錄並初始化 CSV Writer
+    6. 初始化 SQL Uploader（如果啟用）
+    7. 啟動資料收集執行緒和 DAQ 讀取執行緒
+    
+    請求格式：
+        JSON，包含：
+        - label: 資料標籤（必需）
+        - sql_enabled: 是否啟用 SQL 上傳（可選）
+        - sql_host, sql_port, sql_user, sql_password, sql_database: SQL 設定（可選）
+    
+    Returns:
+        JSON 回應，包含：
+        - success: 是否成功
+        - message: 回應訊息（包含取樣率、分檔間隔、SQL 上傳間隔等資訊）
+    
+    注意：
+        - 如果已在收集中，返回錯誤
+        - SQL 設定可以從 sql.ini 讀取，也可以由前端提供（覆蓋 INI 設定）
+        - 輸出目錄格式：output/ProWaveDAQ/{timestamp}_{label}/
+    """
     global is_collecting, collection_thread, daq_instance, csv_writer_instance
     global target_size, current_data_size, realtime_data, data_counter
     global sql_uploader_instance, sql_target_size, sql_current_data_size, sql_enabled, sql_config
@@ -298,7 +411,6 @@ def start_collection():
             global last_data_request_time
             last_data_request_time = 0
 
-        # 載入設定檔
         ini_file_path = "API/Master.ini"
         config = configparser.ConfigParser()
         config.read(ini_file_path, encoding='utf-8')
@@ -307,13 +419,10 @@ def start_collection():
             return jsonify({'success': False, 'message': '無法讀取 Master.ini'})
 
         save_unit = config.getint('SaveUnit', 'second', fallback=5)
-        
-        # 讀取 SQL 上傳間隔（如果存在）
         sql_upload_interval = config.getint('SaveUnit', 'sql_upload_interval', fallback=0)
         if sql_upload_interval <= 0:
-            sql_upload_interval = save_unit  # 預設與 CSV 相同
+            sql_upload_interval = save_unit
 
-        # 從 sql.ini 檔案讀取 SQL 設定（預設值）
         sql_ini_file_path = "API/sql.ini"
         sql_config_parser = configparser.ConfigParser()
         sql_config_parser.read(sql_ini_file_path, encoding='utf-8')
@@ -335,11 +444,8 @@ def start_collection():
             sql_config_ini['password'] = sql_config_parser.get('SQLServer', 'password', fallback='')
             sql_config_ini['database'] = sql_config_parser.get('SQLServer', 'database', fallback='prowavedaq')
 
-        # 取得 SQL 設定（前端可以覆蓋 INI 設定）
-        # 如果前端有提供 sql_enabled，則使用前端的值；否則使用 INI 的值
         if data and 'sql_enabled' in data:
             sql_enabled = data.get('sql_enabled', False)
-            # 如果前端啟用 SQL，則使用前端的設定（如果提供），否則使用 INI 設定
             if sql_enabled:
                 sql_config = {
                     'host': data.get('sql_host', sql_config_ini['host']),
@@ -351,33 +457,24 @@ def start_collection():
             else:
                 sql_config = sql_config_ini.copy()
         else:
-            # 前端沒有提供 sql_enabled，使用 INI 設定
             sql_enabled = sql_enabled_ini
             sql_config = sql_config_ini.copy()
 
-        # 初始化 DAQ
         daq_instance = ProWaveDAQ()
         daq_instance.init_devices("API/ProWaveDAQ.ini")
         sample_rate = daq_instance.get_sample_rate()
-        channels = 3  # 固定3通道
+        channels = 3
 
-        # 計算目標大小
         expected_samples_per_second = sample_rate * channels
         target_size = save_unit * expected_samples_per_second
         sql_target_size = sql_upload_interval * expected_samples_per_second
-        
-        # 設定 SQL 緩衝區最大大小（防止記憶體溢出）
-        # 最多保留 2 倍 sql_target_size 的資料，或最多 10,000,000 個資料點（約 240 MB）
-        # 取較小值以確保記憶體安全
         sql_buffer_max_size = min(sql_target_size * 2, 10_000_000)
 
-        # 建立輸出目錄（在專案根目錄的 output 資料夾中）
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         folder = f"{timestamp}_{label}"
         output_path = os.path.join(PROJECT_ROOT, "output", "ProWaveDAQ", folder)
         os.makedirs(output_path, exist_ok=True)
 
-        # 初始化 CSV Writer（傳入取樣率以正確計算時間戳記）
         csv_writer_instance = CSVWriter(channels, output_path, label, sample_rate)
 
         sql_uploader_instance = None
@@ -394,7 +491,6 @@ def start_collection():
             except Exception as e:
                 return jsonify({'success': False, 'message': f'SQL 上傳器初始化失敗: {str(e)}'})
 
-        # 啟動資料收集執行緒
         is_collecting = True
         collection_thread = threading.Thread(
             target=collection_loop, daemon=True)
@@ -415,7 +511,25 @@ def start_collection():
 
 @app.route('/stop', methods=['POST'])
 def stop_collection():
-    """停止所有執行緒、安全關閉，並上傳剩餘資料"""
+    """
+    停止資料收集（停止所有執行緒、安全關閉，並上傳剩餘資料）
+    
+    此函數會：
+    1. 停止資料收集執行緒（設定 is_collecting = False）
+    2. 停止 DAQ 讀取執行緒
+    3. 上傳 SQL 緩衝區中的剩餘資料（如果啟用 SQL）
+    4. 關閉 CSV Writer 和 SQL Uploader
+    
+    Returns:
+        JSON 回應，包含：
+        - success: 是否成功
+        - message: 回應訊息
+    
+    注意：
+        - 如果未在收集中，返回錯誤
+        - 停止時會自動上傳 SQL 緩衝區中的剩餘資料（即使未達到門檻）
+        - 所有檔案和連線會安全關閉
+    """
     global is_collecting, daq_instance, csv_writer_instance, sql_uploader_instance
     global current_data_size, sql_current_data_size, sql_enabled
 
@@ -425,7 +539,6 @@ def stop_collection():
     try:
         is_collecting = False
 
-        # 停止 DAQ
         if daq_instance:
             daq_instance.stop_reading()
 
@@ -477,16 +590,35 @@ def stop_collection():
 
 @app.route('/files')
 def list_files():
-    """列出 output 目錄中的檔案和資料夾"""
+    """
+    列出 output 目錄中的檔案和資料夾
+    
+    此 API 用於檔案瀏覽功能，可以瀏覽 output/ProWaveDAQ/ 目錄下的所有檔案和資料夾。
+    
+    查詢參數：
+        path (可選): 要瀏覽的子目錄路徑
+    
+    Returns:
+        JSON 回應，包含：
+        - success: 是否成功
+        - items: 檔案和資料夾列表，每個項目包含：
+            - name: 名稱
+            - type: 類型（'directory' 或 'file'）
+            - path: 相對路徑
+            - size: 檔案大小（僅檔案有）
+        - current_path: 當前路徑
+        - message: 錯誤訊息（如果失敗）
+    
+    安全機制：
+        - 路徑標準化檢查，防止目錄遍歷攻擊
+        - 只允許存取 output/ProWaveDAQ/ 目錄下的檔案
+    """
     try:
         path = request.args.get('path', '')
-        # 安全檢查：只允許在專案根目錄的 output/ProWaveDAQ 目錄下瀏覽
         base_path = os.path.join(PROJECT_ROOT, "output", "ProWaveDAQ")
         
         if path:
-            # 確保路徑在 base_path 內
             full_path = os.path.join(base_path, path)
-            # 標準化路徑以檢查是否在 base_path 內
             full_path = os.path.normpath(full_path)
             base_path_norm = os.path.normpath(os.path.abspath(base_path))
             full_path_abs = os.path.abspath(full_path)
@@ -504,7 +636,7 @@ def list_files():
             for item in sorted(os.listdir(full_path)):
                 item_path = os.path.join(full_path, item)
                 relative_path = os.path.join(path, item) if path else item
-                relative_path = relative_path.replace('\\', '/')  # 統一使用 /
+                relative_path = relative_path.replace('\\', '/')
                 
                 if os.path.isdir(item_path):
                     items.append({
@@ -534,17 +666,31 @@ def list_files():
 
 @app.route('/download')
 def download_file():
-    """下載檔案"""
+    """
+    下載檔案
+    
+    此 API 用於下載 output/ProWaveDAQ/ 目錄下的 CSV 檔案。
+    
+    查詢參數：
+        path (必需): 要下載的檔案路徑（相對於 output/ProWaveDAQ/）
+    
+    Returns:
+        檔案下載響應（如果成功）
+        或 JSON 錯誤回應（如果失敗）
+    
+    安全機制：
+        - 路徑標準化檢查，防止目錄遍歷攻擊
+        - 只允許下載 output/ProWaveDAQ/ 目錄下的檔案
+        - 不允許下載資料夾
+    """
     try:
         path = request.args.get('path', '')
         if not path:
             return jsonify({'success': False, 'message': '請提供檔案路徑'})
         
-        # 安全檢查：只允許下載專案根目錄的 output/ProWaveDAQ 目錄下的檔案
         base_path = os.path.join(PROJECT_ROOT, "output", "ProWaveDAQ")
         full_path = os.path.join(base_path, path)
         
-        # 標準化路徑以檢查是否在 base_path 內
         full_path = os.path.normpath(full_path)
         base_path_norm = os.path.normpath(os.path.abspath(base_path))
         full_path_abs = os.path.abspath(full_path)
@@ -571,29 +717,30 @@ def collection_loop():
     資料收集主迴圈（在獨立執行緒中執行）
     
     此函數是整個系統的核心資料處理迴圈，負責：
-    1. 從 DAQ 設備讀取資料
-    2. 更新即時顯示緩衝區
-    3. 將資料寫入 CSV 檔案（自動分檔）
-    4. 將資料上傳至 SQL 伺服器（如果啟用）
+    1. 從 DAQ 設備讀取資料（非阻塞方式）
+    2. 更新即時顯示緩衝區（智慧緩衝區更新機制）
+    3. 將資料寫入 CSV 檔案（自動分檔，確保樣本邊界）
+    4. 將資料上傳至 SQL 伺服器（如果啟用，獨立緩衝區）
     
     資料流程：
-    DAQ 設備 → DAQ 佇列 → collection_loop → CSV/SQL/即時顯示
+        DAQ 設備 → DAQ 佇列 → collection_loop → CSV/SQL/即時顯示
     
     重要設計原則：
-    - CSV 分檔：確保切斷位置在樣本邊界（3的倍數），避免部分樣本
-    - SQL 上傳：使用獨立的緩衝區，與 CSV 分檔邏輯完全獨立
-    - 記憶體保護：SQL 緩衝區有最大大小限制，超過時強制上傳
-    - 資料保護：SQL 上傳失敗時保留資料在緩衝區，等待重試
+        - CSV 分檔：確保切斷位置在樣本邊界（3的倍數），避免通道錯位
+        - SQL 上傳：使用獨立的緩衝區，與 CSV 分檔邏輯完全獨立
+        - 記憶體保護：SQL 緩衝區有最大大小限制，超過時強制上傳
+        - 資料保護：SQL 上傳失敗時保留資料在緩衝區，等待重試
     
     注意：
-    - 此函數在背景執行緒中執行，不會阻塞主執行緒
-    - 使用非阻塞方式從 DAQ 取得資料，避免長時間等待
+        - 此函數在背景執行緒中執行，不會阻塞主執行緒
+        - 使用非阻塞方式從 DAQ 取得資料，避免長時間等待
+        - 每次處理後會短暫休息（10ms），避免 CPU 過載
     """
     global is_collecting, daq_instance, csv_writer_instance, sql_uploader_instance
     global target_size, current_data_size, sql_target_size, sql_current_data_size, sql_enabled
     global sql_data_buffer, sql_buffer_max_size
     
-    channels = 3  # 固定3通道（X, Y, Z）
+    channels = 3
 
     while is_collecting:
         try:
@@ -689,19 +836,24 @@ def collection_loop():
             time.sleep(0.01)
 
         except Exception as e:
-            # 處理未預期的錯誤
             error(f"Data collection loop error: {e}")
-            time.sleep(0.1)  # 發生錯誤時等待 100ms 後繼續
+            time.sleep(0.1)
 
 
 def run_flask_server(port: int = 8080):
     """
     在獨立執行緒中執行 Flask 伺服器
     
+    此函數會在背景執行緒中啟動 Flask Web 伺服器，提供 HTTP API 和 Web 介面。
+    
     Args:
         port: Flask 伺服器監聽的埠號（預設為 8080）
+    
+    注意：
+        - 監聽所有網路介面（0.0.0.0），允許遠端存取
+        - 禁用除錯模式和重新載入器（避免與執行緒衝突）
+        - 禁用 Flask 的 HTTP 請求日誌，只顯示應用程式日誌
     """
-    # 確保在啟動前禁用 HTTP 請求日誌
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     
@@ -709,8 +861,29 @@ def run_flask_server(port: int = 8080):
 
 
 def main():
-    """主函數"""
-    # ========== 解析命令行參數 ==========
+    """
+    主函數（程式入口點）
+    
+    此函數會：
+    1. 解析命令行參數（埠號）
+    2. 驗證埠號範圍
+    3. 在背景執行緒中啟動 Flask 伺服器
+    4. 主執行緒進入等待迴圈，等待使用者中斷
+    5. 收到中斷信號時安全關閉所有資源
+    
+    命令行參數：
+        -p, --port: Flask 伺服器監聽的埠號（預設: 8080）
+    
+    範例：
+        python src/main.py              # 使用預設 port 8080
+        python src/main.py --port 3000  # 使用自訂 port 3000
+        python src/main.py -p 9000      # 使用自訂 port 9000
+    
+    注意：
+        - 埠號範圍必須在 1-65535 之間
+        - 使用 Ctrl+C 可以安全關閉伺服器
+        - 關閉時會自動停止資料收集並關閉所有連線
+    """
     parser = argparse.ArgumentParser(
         description='ProWaveDAQ Real-time Data Visualization System',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -731,7 +904,6 @@ def main():
     args = parser.parse_args()
     port = args.port
     
-    # 驗證 port 範圍（1-65535）
     if not (1 <= port <= 65535):
         error(f"無效的埠號: {port}，請使用 1-65535 之間的數字")
         sys.exit(1)
@@ -743,11 +915,9 @@ def main():
     info("Press Ctrl+C to stop the server")
     info("=" * 60)
 
-    # 在背景執行緒中啟動 Flask 伺服器（使用指定的 port）
     flask_thread = threading.Thread(target=run_flask_server, args=(port,), daemon=True)
     flask_thread.start()
 
-    # 等待使用者中斷
     try:
         while True:
             time.sleep(1)
@@ -767,9 +937,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# In case I don't see you
-# Good afternoon, Good evening, and good night.
-
-# You got the dream
-# You gotta protect it.

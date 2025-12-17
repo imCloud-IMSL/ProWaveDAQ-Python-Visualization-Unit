@@ -1,532 +1,369 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ProWaveDAQ Python版本
-振動數據採集系統 - 使用Modbus RTU通訊協議
+ProWaveDAQ 設備通訊模組
 
-版本：3.0.0
+此模組負責與 ProWaveDAQ 設備進行 Modbus RTU 通訊，讀取振動數據。
+使用標準的 Modbus RTU 協議，符合原廠 RS485 Modbus RTU 手冊規範。
 
-設計目標：
-- 對外 API 與原本版本相容（給 main / 前端用）
-- 讀取流程模組化，方便未來調整
-- 確保 X/Y/Z 通道不會錯位：每次讀取只處理「當次完整的 XYZ 三軸組」
+主要功能：
+    - 建立 Modbus RTU 連線
+    - 設定設備取樣率
+    - 從設備讀取振動數據（三通道：X, Y, Z）
+    - 資料格式轉換（16位元整數 → 浮點數）
+    - 將資料放入佇列供其他模組使用
+
+版本：4.0.0
 """
 
-import re
 import time
 import threading
 import configparser
-from typing import List, Optional
-import glob
-import sys
 import queue
+from typing import List, Optional
+
+from pymodbus.client import ModbusSerialClient
 
 try:
-    from pymodbus.client import ModbusSerialClient
+    from logger import info, debug, warning, error
 except ImportError:
-    print("Error: Unable to find compatible pymodbus version")
-    print("Please ensure pymodbus is installed: pip install pymodbus>=3.6.0")
-    print("Or try reinstalling: pip uninstall pymodbus && pip install pymodbus>=3.6.0")
-    sys.exit(1)
-
-try:
-    from logger import info, debug, error, warning
-except ImportError:
-    def info(msg): print(f"[INFO] {msg}")
-    def debug(msg): print(f"[DEBUG] {msg}")
-    def error(msg): print(f"[ERROR] {msg}")
-    def warning(msg): print(f"[WARN] {msg}")
+    def info(m): print(f"[INFO] {m}")
+    def debug(m): print(f"[DEBUG] {m}")
+    def warning(m): print(f"[WARN] {m}")
+    def error(m): print(f"[ERROR] {m}")
 
 
 class ProWaveDAQ:
-    """ProWaveDAQ 振動數據採集類別"""
-
-    # Modbus 寄存器定義
-    REG_SAMPLE_RATE = 0x01       # 取樣率設定
-    REG_FIFO_LEN = 0x02          # FIFO 長度 / Normal Mode 數據和長度讀取的起始地址
-    REG_CHIP_ID = 0x80           # 晶片 ID 起始位址
+    """
+    ProWaveDAQ 設備通訊類別
     
-    # Bulk Mode 相關定義
-    BULK_MODE_ADDRESS = 0x15     # Bulk Mode 數據的起始地址
-    MAX_BULK_SIZE = 9            # Bulk Mode 建議的傳輸區塊大小
-    BULK_TRIGGER_SIZE = 123      # Normal Mode 的最大讀取上限 / Bulk Mode 的切換門檻
+    此類別封裝了與 ProWaveDAQ 設備的所有通訊功能，包括：
+    - Modbus RTU 連線管理
+    - 設備初始化與設定
+    - 資料讀取與轉換
+    - 多執行緒安全的資料佇列管理
+    
+    使用方式：
+        daq = ProWaveDAQ()
+        daq.init_devices("API/ProWaveDAQ.ini")
+        daq.start_reading()
+        data = daq.get_data()  # 非阻塞取得資料
+        daq.stop_reading()
+    """
+    
+    # Modbus 寄存器位址（原廠定義）
+    REG_SAMPLE_RATE = 0x01      # 取樣率設定寄存器
+    REG_FIFO_LEN = 0x02         # FIFO 緩衝區長度寄存器
+    REG_RAW_DATA_START = 0x03   # 原始資料起始寄存器
 
-    CHANNEL_COUNT = 3            # X, Y, Z
+    CHANNELS = 3                # 通道數量（固定為 3：X, Y, Z）
+    MAX_READ_WORDS = 123        # 單次讀取的最大字數（Modbus 手冊上限）
 
     def __init__(self):
-        """初始化 ProWaveDAQ 物件（只做狀態初始化，不連線）"""
-        self.client: Optional[ModbusSerialClient] = None
-        self.serial_port = "/dev/ttyUSB0"
-        self.baud_rate = 3000000
-        self.sample_rate = 7812
-        self.slave_id = 1
-
-        self.counter = 0
-        self.reading = False
-        self.reading_thread: Optional[threading.Thread] = None
-        self.buffer_count = 0
-
-        self.data_queue: "queue.Queue[List[float]]" = queue.Queue(maxsize=10000)
-        self.latest_data: List[float] = []
-        self.data_mutex = threading.Lock()
-        self.queue_mutex = threading.Lock()
-        self.remaining_data: List[int] = []
-        self.remaining_data_lock = threading.Lock()
-
-    def scan_devices(self) -> None:
         """
-        掃描 /dev/ttyUSB* 下可用的 Modbus 設備
+        初始化 ProWaveDAQ 類別
         
-        此方法會掃描系統中所有符合 /dev/ttyUSB* 模式的串列埠設備，
-        並在日誌中列出找到的設備。這有助於確認設備是否正確連接。
+        設定預設參數並初始化內部狀態變數。
+        實際的設備設定會從 INI 檔案讀取（在 init_devices() 中）。
+        """
+        self.serial_port = "/dev/ttyUSB0"    # 預設串列埠路徑
+        self.baud_rate = 3_000_000           # 預設鮑率（3 Mbps）
+        self.sample_rate = 7812              # 預設取樣率（Hz）
+        self.slave_id = 1                    # 預設 Modbus 從站 ID
+
+        self.client: Optional[ModbusSerialClient] = None  # Modbus 連線物件
+        self.reading = False                              # 讀取狀態旗標
+        self.thread: Optional[threading.Thread] = None   # 讀取執行緒
+
+        self.queue: "queue.Queue[List[float]]" = queue.Queue(maxsize=5000)  # 資料佇列（執行緒安全）
+
+    def init_devices(self, ini_path: str):
+        """
+        從 INI 設定檔初始化設備並建立 Modbus 連線
         
-        注意：此方法只掃描設備，不會建立連線。
+        此方法會：
+        1. 讀取 INI 設定檔（ProWaveDAQ.ini）
+        2. 設定設備參數（串列埠、鮑率、取樣率、從站 ID）
+        3. 建立 Modbus RTU 連線
+        4. 設定設備取樣率
+        
+        Args:
+            ini_path: INI 設定檔路徑（例如："API/ProWaveDAQ.ini"）
+        
+        Raises:
+            RuntimeError: 如果 Modbus 連線失敗
+        
+        注意：
+            - INI 檔案必須包含 [ProWaveDAQ] 區段
+            - 如果參數不存在，使用預設值
         """
-        devices: List[str] = []
-        usb_pattern = re.compile(r'/dev/ttyUSB[0-9]+')
+        cfg = configparser.ConfigParser()
+        cfg.read(ini_path, encoding="utf-8")
 
-        try:
-            for entry in glob.glob('/dev/ttyUSB*'):
-                if usb_pattern.match(entry):
-                    devices.append(entry)
-        except Exception as e:
-            error(f"Error scanning devices: {e}")
-            return
-
-        if not devices:
-            error("No Modbus devices found!")
-            return
-
-        debug("Available Modbus devices:")
-        for i, dev in enumerate(devices, 1):
-            debug(f"({i}) {dev}")
-
-    def init_devices(self, filename: str) -> None:
-        """
-        從 INI 檔案初始化設備並建立 Modbus 連線
-        INI 段落： [ProWaveDAQ]
-            serialPort = /dev/ttyUSB0
-            baudRate   = 3000000
-            sampleRate = 7812
-            slaveID    = 1
-        """
-        debug("Loading settings from INI file...")
-
-        try:
-            config = configparser.ConfigParser()
-            config.read(filename, encoding="utf-8")
-
-            self.serial_port = config.get(
-                "ProWaveDAQ", "serialPort", fallback="/dev/ttyUSB0"
-            )
-            self.baud_rate = config.getint(
-                "ProWaveDAQ", "baudRate", fallback=3000000
-            )
-            self.sample_rate = config.getint(
-                "ProWaveDAQ", "sampleRate", fallback=7812
-            )
-            self.slave_id = config.getint("ProWaveDAQ", "slaveID", fallback=1)
-
-            debug(
-                "Settings loaded from INI file:\n"
-                f"  Serial Port: {self.serial_port}\n"
-                f"  Baud Rate  : {self.baud_rate}\n"
-                f"  Sample Rate: {self.sample_rate}\n"
-                f"  Slave ID   : {self.slave_id}"
-            )
-        except Exception as e:
-            error(f"Error parsing INI file: {e}")
-            return
+        self.serial_port = cfg.get("ProWaveDAQ", "serialPort", fallback=self.serial_port)
+        self.baud_rate = cfg.getint("ProWaveDAQ", "baudRate", fallback=self.baud_rate)
+        self.sample_rate = cfg.getint("ProWaveDAQ", "sampleRate", fallback=self.sample_rate)
+        self.slave_id = cfg.getint("ProWaveDAQ", "slaveID", fallback=self.slave_id)
 
         if not self._connect():
-            error("Failed to establish Modbus connection!")
-            return
+            raise RuntimeError("Modbus connect failed")
 
-        self._read_chip_id()
         self._set_sample_rate()
 
-    def start_reading(self) -> None:
-        """開始讀取振動數據（背景執行緒）"""
-        if self.reading:
-            warning("Reading is already in progress")
-            return
-
-        if not self._ensure_connected():
-            error("Cannot start reading: Modbus connection not available")
-            return
-
-        self.counter = 0
-        self.buffer_count = 0
-        with self.remaining_data_lock:
-            self.remaining_data = []
-        self.reading = True
-        self.reading_thread = threading.Thread(
-            target=self._read_loop, name="ProWaveDAQReadLoop"
+    def _connect(self) -> bool:
+        """
+        建立 Modbus RTU 連線
+        
+        此方法會建立 ModbusSerialClient 並連線到設備。
+        
+        Returns:
+            bool: 連線成功返回 True，失敗返回 False
+        
+        注意：
+            - 連線參數：無同位位元（N）、1 個停止位元、8 個資料位元
+            - 超時時間設定為 1 秒
+            - 使用 RTU 框架格式
+        """
+        self.client = ModbusSerialClient(
+            port=self.serial_port,
+            baudrate=self.baud_rate,
+            parity="N",
+            stopbits=1,
+            bytesize=8,
+            timeout=1,
+            framer="rtu",
         )
-        self.reading_thread.daemon = True
-        self.reading_thread.start()
+        if not self.client.connect():
+            return False
+        self.client.unit_id = self.slave_id
+        info("Modbus connection established")
+        return True
+
+    def _set_sample_rate(self):
+        """
+        設定設備取樣率
+        
+        此方法會寫入取樣率到設備的設定寄存器。
+        
+        注意：
+            - 取樣率必須符合設備支援的範圍
+            - 如果設定失敗，會輸出錯誤訊息但不會拋出例外
+        """
+        r = self.client.write_register(self.REG_SAMPLE_RATE, self.sample_rate)
+        if r.isError():
+            error("Failed to set sample rate")
+        else:
+            debug(f"Sample rate set to {self.sample_rate} Hz")
+
+    def start_reading(self):
+        """
+        啟動資料讀取（在背景執行緒中執行）
+        
+        此方法會建立並啟動一個背景執行緒，持續從設備讀取資料。
+        如果已經在讀取中，則不會重複啟動。
+        
+        注意：
+            - 執行緒設定為 daemon=True，主程式結束時自動終止
+            - 讀取的資料會放入 queue 中，供 get_data() 取得
+        """
+        if self.reading:
+            return
+        self.reading = True
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
         info("ProWaveDAQ reading started")
 
-    def stop_reading(self) -> None:
-        """停止讀取振動數據，並關閉連線"""
-        if self.reading:
-            self.reading = False
-            if self.reading_thread and self.reading_thread.is_alive():
-                self.reading_thread.join()
-
-        self.counter = 0
-
-        with self.remaining_data_lock:
-            if self.remaining_data:
-                warning(f"Discarding {len(self.remaining_data)} remaining raw data points on stop")
-            self.remaining_data = []
-
-        while not self.data_queue.empty():
-            try:
-                self.data_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        self._disconnect()
+    def stop_reading(self):
+        """
+        停止資料讀取並清理資源
+        
+        此方法會：
+        1. 設定 reading = False（停止讀取迴圈）
+        2. 等待讀取執行緒結束
+        3. 關閉 Modbus 連線
+        
+        注意：
+            - 此方法會阻塞直到讀取執行緒結束
+            - 連線關閉後需要重新呼叫 init_devices() 才能再次使用
+        """
+        self.reading = False
+        if self.thread:
+            self.thread.join()
+        if self.client:
+            self.client.close()
         info("ProWaveDAQ reading stopped")
 
     def get_data(self) -> List[float]:
         """
-        非阻塞取得最新一批振動數據
-        回傳：
-            List[float]，格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
-            若目前沒有資料則回傳空 list
-        """
-        try:
-            return self.data_queue.get_nowait()
-        except queue.Empty:
-            return []
-
-    def get_data_blocking(self, timeout: float = 0.1) -> List[float]:
-        """
-        阻塞取得最新一批振動數據
-        timeout:
-            最多等待秒數
-        回傳：
-            List[float]，格式為 [X1, Y1, Z1, ...]
-            若 timeout 內無資料則回傳空 list
-        """
-        try:
-            return self.data_queue.get(timeout=timeout)
-        except queue.Empty:
-            return []
-
-    def get_counter(self) -> int:
-        """回傳 read loop 成功處理的批次數"""
-        return self.counter
-
-    def reset_counter(self) -> None:
-        """重置讀取批次計數器"""
-        self.counter = 0
-
-    def get_sample_rate(self) -> int:
-        """回傳目前設定的取樣率"""
-        return self.sample_rate
-
-    def _connect(self) -> bool:
-        """建立 Modbus RTU 連線"""
-        try:
-            if self.client:
-                try:
-                    self.client.close()
-                except Exception:
-                    pass
-
-            self.client = ModbusSerialClient(
-                port=self.serial_port,
-                baudrate=self.baud_rate,
-                timeout=1,
-                parity="N",
-                stopbits=1,
-                bytesize=8,
-                framer="rtu",
-            )
-
-            if not self.client.connect():
-                error("ModbusSerialClient.connect() failed")
-                self.client = None
-                return False
-
-            self.client.unit_id = self.slave_id
-            
-            try:
-                self.client.framer.skip_encode_mobile = True
-                self.client.framer.decode_buffer_size = 2048
-            except AttributeError:
-                pass
-            
-            info("Modbus connection established")
-            return True
-        except Exception as e:
-            error(f"Error establishing Modbus connection: {e}")
-            self.client = None
-            return False
-
-    def _disconnect(self) -> None:
-        """關閉 Modbus 連線"""
-        try:
-            if self.client:
-                self.client.close()
-        except Exception:
-            pass
-        finally:
-            self.client = None
-
-    def _ensure_connected(self) -> bool:
-        """如果連線不存在或中斷，嘗試重連"""
-        if not self.client:
-            return self._connect()
-
-        try:
-            if self.client.is_connected():
-                return True
-        except AttributeError:
-            return True
-        except Exception as e:
-            warning(f"Error checking connection state: {e}")
-
-        warning("Modbus connection lost, attempting to reconnect...")
-        return self._connect()
-
-    def _read_chip_id(self) -> None:
-        """讀取晶片 ID"""
-        if not self.client:
-            return
-
-        try:
-            result = self.client.read_input_registers(
-                address=self.REG_CHIP_ID, count=3
-            )
-            if result.isError():
-                warning("Failed to read chip ID")
-                return
-
-            regs = result.registers
-            if len(regs) >= 3:
-                debug(f"Chip ID: {hex(regs[0])}, {hex(regs[1])}, {hex(regs[2])}")
-            else:
-                warning(f"Chip ID read length unexpected: {len(regs)}")
-        except Exception as e:
-            warning(f"Error reading chip ID: {e}")
-
-    def _set_sample_rate(self) -> None:
-        """寫入取樣率到寄存器"""
-        if not self.client:
-            return
-
-        try:
-            result = self.client.write_register(
-                address=self.REG_SAMPLE_RATE, value=self.sample_rate
-            )
-            if result.isError():
-                error("Failed to set sample rate")
-            else:
-                debug(f"Sample rate set to {self.sample_rate} Hz")
-        except Exception as e:
-            error(f"Error setting sample rate: {e}")
-
-    def _read_registers_with_header(self, address: int, count: int, mode_name: str) -> tuple[List[int], int]:
-        """
-        執行 Modbus 讀取 (FC=04)，並處理標頭(Header)
-        讀取點數是 N + 1（第一個暫存器是 Header，包含剩餘樣本數）
+        非阻塞式取得資料（從佇列取出）
         
-        Args:
-            address: 起始寄存器地址
-            count: 要讀取的資料樣本數（word 數）
-            mode_name: 模式名稱（用於錯誤訊息）
+        此方法會從資料佇列中取得一批資料。如果佇列為空，立即返回空列表。
         
         Returns:
-            tuple[List[int], int]: (payload_data, remaining_samples)
-        """
-        if not self.client:
-            return [], 0
-        
-        read_count = count + 1
-        
-        try:
-            result = self.client.read_input_registers(
-                address=address, count=read_count
-            )
-            
-            if result.isError() or len(result.registers) != read_count:
-                warning(f"錯誤或資料長度不符 in {mode_name} Read: expected {read_count}, got {len(result.registers) if not result.isError() else 0}")
-                return [], 0
-            
-            raw_data = result.registers
-            payload_data = raw_data[1:]
-            remaining_samples = raw_data[0]
-            
-            return payload_data, remaining_samples
-        except Exception as e:
-            warning(f"Error in {mode_name} read: {e}")
-            return [], 0
-    
-    def _read_normal_data(self, samples_to_read: int) -> tuple[List[int], int]:
-        """
-        Normal Mode 讀取 (FC=04, Address 0x02)
-        當 buffer_count <= BULK_TRIGGER_SIZE (123) 時使用此模式
-        """
-        final_read_count = min(samples_to_read, self.BULK_TRIGGER_SIZE)
-        return self._read_registers_with_header(
-            address=self.REG_FIFO_LEN,
-            count=final_read_count,
-            mode_name="Normal Mode"
-        )
-    
-    def _read_bulk_data(self, samples_to_read: int) -> tuple[List[int], int]:
-        """
-        Bulk Mode 讀取 (FC=04, Address 0x15)
-        當 buffer_count > BULK_TRIGGER_SIZE (123) 時使用此模式
-        """
-        bulk_count = min(samples_to_read, self.MAX_BULK_SIZE)
-        return self._read_registers_with_header(
-            address=self.BULK_MODE_ADDRESS,
-            count=bulk_count,
-            mode_name="Bulk Mode"
-        )
-    
-    def _get_buffer_status(self) -> int:
-        """
-        讀取緩衝區樣本數 (FC=04, Address 0x02)
-        """
-        if not self.client:
-            return 0
-        
-        try:
-            result = self.client.read_input_registers(
-                address=self.REG_FIFO_LEN, count=1
-            )
-            if result.isError():
-                return 0
-            return result.registers[0] if result.registers else 0
-        except Exception as e:
-            warning(f"Error reading buffer status: {e}")
-            return 0
-
-    @staticmethod
-    def _convert_raw_to_float_samples(raw_block: List[int]) -> List[float]:
-        """
-        將一批原始資料轉成浮點數列表，並保證 XYZ 通道不錯位
-        
-        此方法會：
-        1. 只處理完整的 XYZ 三軸組（捨棄不足一組的資料）
-        2. 將 16-bit 有符號整數轉換為浮點數（除以 8192.0）
-        3. 確保輸出格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
-        
-        Args:
-            raw_block: 原始資料列表（16-bit 無符號整數），格式為 [X, Y, Z, X, Y, Z, ...]
-        
-        Returns:
-            List[float]: 轉換後的浮點數列表，格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
+            List[float]: 資料列表，格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
+                        如果佇列為空，返回空列表 []
         
         注意：
-            - 如果資料長度不是 3 的倍數，會自動捨棄最後不足一組 XYZ 的資料
-            - 這是為了避免通道錯位（例如：如果最後只有 1 個值，無法確定是 X、Y 還是 Z）
-            - 轉換公式：signed_value = (value < 32768) ? value : value - 65536
-            - 最終浮點數 = signed_value / 8192.0
+            - 此方法是非阻塞的，不會等待資料
+            - 資料格式：每 3 個為一組（X, Y, Z）
+            - 建議在迴圈中持續呼叫此方法以取得所有資料
         """
-        if not raw_block:
+        try:
+            return self.queue.get_nowait()
+        except queue.Empty:
             return []
 
-        sample_word_count = (len(raw_block) // ProWaveDAQ.CHANNEL_COUNT) * ProWaveDAQ.CHANNEL_COUNT
-        if sample_word_count <= 0:
-            return []
-
-        data_words = raw_block[:sample_word_count]
-        float_samples: List[float] = []
-        for w in data_words:
-            signed = w if w < 32768 else w - 65536
-            float_samples.append(signed / 8192.0)
-
-        return float_samples
-
-    def _read_loop(self) -> None:
+    def get_sample_rate(self) -> int:
         """
-        主要讀取迴圈（在背景執行緒中執行）
-        使用 Normal Mode 和 Bulk Mode 自動切換
+        取得當前設定的取樣率
+        
+        Returns:
+            int: 取樣率（Hz）
         """
-        consecutive_errors = 0
-        max_consecutive_errors = 5
+        return self.sample_rate
 
+    def _read_loop(self):
+        """
+        資料讀取主迴圈（在背景執行緒中執行）
+        
+        此迴圈會持續從設備讀取資料，直到 reading 旗標為 False。
+        
+        運作流程：
+        1. 讀取 FIFO 緩衝區長度
+        2. 如果緩衝區為空，等待 2ms 後繼續
+        3. 計算要讀取的資料量（最多 123 個字，且必須是 3 的倍數）
+        4. 讀取原始資料（16 位元整數）
+        5. 轉換為浮點數
+        6. 放入資料佇列
+        
+        注意：
+            - 確保每次讀取的資料量是 3 的倍數，避免通道錯位
+            - 如果讀取失敗，會等待 100ms 後繼續
+            - 此迴圈在背景執行緒中執行，不會阻塞主執行緒
+        """
         debug("Read loop started")
 
         while self.reading:
-            if not self._ensure_connected():
-                consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
-                    error("Too many connection failures, stopping read loop")
-                    break
-                time.sleep(0.5)
-                continue
-
             try:
-                if self.buffer_count == 0:
-                    self.buffer_count = self._get_buffer_status()
-                    if self.buffer_count == 0:
-                        time.sleep(0.01)
-                        continue
+                fifo_words = self._read_fifo_size()
+                if fifo_words <= 0:
+                    time.sleep(0.002)
+                    continue
 
-                collected_data = []
-                remaining = 0
-                
-                if self.buffer_count <= self.BULK_TRIGGER_SIZE:
-                    samples_to_read = self.buffer_count
-                    collected_data, remaining = self._read_normal_data(samples_to_read)
-                else:
-                    samples_to_read = self.buffer_count
-                    collected_data, remaining = self._read_bulk_data(samples_to_read)
-                
-                if collected_data and len(collected_data) % self.CHANNEL_COUNT == 0:
-                    samples = self._convert_raw_to_float_samples(collected_data)
-                    if not samples:
-                        warning("Failed to convert raw data to float samples")
-                        self.buffer_count = 0
-                        continue
-                    
-                    try:
-                        self.data_queue.put_nowait(samples)
-                    except queue.Full:
-                        try:
-                            self.data_queue.get_nowait()
-                            self.data_queue.put_nowait(samples)
-                        except queue.Empty:
-                            pass
-                    
-                    self.buffer_count = remaining
-                    consecutive_errors = 0
-                    self.counter += 1
-                    
-                elif collected_data:
-                    warning(f"Collected data length ({len(collected_data)}) is not a multiple of {self.CHANNEL_COUNT}. Resetting buffer count.")
-                    self.buffer_count = 0
-                else:
-                    self.buffer_count = 0
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        error("Too many read failures, stopping read loop")
-                        break
-                
-                time.sleep(0.0001)
+                read_words = min(fifo_words, self.MAX_READ_WORDS)
+                read_words = (read_words // self.CHANNELS) * self.CHANNELS
+                if read_words == 0:
+                    continue
+
+                raw = self._read_raw_data(read_words)
+                if not raw:
+                    continue
+
+                samples = self._convert_to_float(raw)
+                if samples:
+                    self._push(samples)
 
             except Exception as e:
-                consecutive_errors += 1
-                error(f"Error in read loop: {e}")
-                if consecutive_errors >= max_consecutive_errors:
-                    error("Too many consecutive errors, stopping read loop")
-                    break
-                self.buffer_count = 0
+                error(f"Read loop error: {e}")
                 time.sleep(0.1)
 
-        self.reading = False
         debug("Read loop exited")
 
-    def __del__(self):
+    def _read_fifo_size(self) -> int:
+        """
+        讀取 FIFO 緩衝區長度
+        
+        此方法會讀取設備的 FIFO 緩衝區長度寄存器，取得當前可讀取的資料量。
+        
+        Returns:
+            int: FIFO 緩衝區中的資料字數（0 表示緩衝區為空）
+        
+        注意：
+            - 如果讀取失敗，返回 0
+            - 此方法用於判斷是否有資料可讀
+        """
+        r = self.client.read_input_registers(
+            address=self.REG_FIFO_LEN,
+            count=1
+        )
+        if r.isError() or not r.registers:
+            return 0
+        return r.registers[0]
+
+    def _read_raw_data(self, words: int) -> List[int]:
+        """
+        讀取原始資料（16 位元整數）
+        
+        此方法會從設備的原始資料寄存器讀取指定數量的資料。
+        
+        Args:
+            words: 要讀取的字數（必須是 3 的倍數）
+        
+        Returns:
+            List[int]: 原始資料列表（16 位元無符號整數）
+                      如果讀取失敗，返回空列表 []
+        
+        注意：
+            - words 參數必須是 3 的倍數，確保讀取完整的樣本（X, Y, Z）
+            - 讀取失敗時會輸出警告訊息
+        """
+        r = self.client.read_input_registers(
+            address=self.REG_RAW_DATA_START,
+            count=words
+        )
+        if r.isError():
+            warning("Raw data read failed")
+            return []
+        return r.registers
+
+    def _convert_to_float(self, raw: List[int]) -> List[float]:
+        """
+        將 16 位元整數轉換為浮點數
+        
+        此方法會將設備返回的 16 位元無符號整數轉換為有符號整數，
+        然後除以 8192.0 進行正規化。
+        
+        轉換公式：
+            - 如果值 < 32768：視為正數
+            - 如果值 >= 32768：視為負數（減去 65536）
+            - 正規化：除以 8192.0
+        
+        Args:
+            raw: 原始資料列表（16 位元無符號整數，範圍 0-65535）
+        
+        Returns:
+            List[float]: 轉換後的浮點數列表
+        
+        範例：
+            輸入：[0, 16384, 32768, 49152]
+            輸出：[0.0, 2.0, -4.0, -2.0]
+        """
+        out: List[float] = []
+        for v in raw:
+            signed = v if v < 32768 else v - 65536
+            out.append(signed / 8192.0)
+        return out
+
+    def _push(self, data: List[float]):
+        """
+        將資料放入佇列（執行緒安全）
+        
+        此方法會將處理後的資料放入資料佇列。如果佇列已滿，
+        會移除最舊的資料（FIFO），然後放入新資料。
+        
+        Args:
+            data: 要放入的資料列表，格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
+        
+        注意：
+            - 使用 put_nowait() 非阻塞放入，避免阻塞讀取迴圈
+            - 佇列滿時會丟棄最舊的資料，確保最新資料優先處理
+            - 佇列最大容量為 5000 筆
+        """
         try:
-            self.stop_reading()
-        except Exception:
-            pass
+            self.queue.put_nowait(data)
+        except queue.Full:
+            try:
+                self.queue.get_nowait()
+                self.queue.put_nowait(data)
+            except queue.Empty:
+                pass

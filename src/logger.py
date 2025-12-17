@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-統一日誌系統
-提供 [INFO]、[Debug]、[Error]、[Warning] 標籤的日誌輸出
+統一日誌系統模組
 
 此模組提供統一的日誌輸出格式，所有日誌訊息都會自動包含時間戳記。
 日誌格式：[YYYY-MM-DD HH:MM:SS] [LEVEL] 訊息內容
+
+支援的日誌級別：
+    - INFO: 一般資訊訊息（輸出到 stdout）
+    - Debug: 調試訊息（輸出到 stdout，可關閉）
+    - Error: 錯誤訊息（輸出到 stderr）
+    - Warning: 警告訊息（輸出到 stdout）
 
 使用方式：
     from logger import info, debug, error, warning
@@ -14,10 +19,12 @@
     debug("這是調試訊息")
     warning("這是警告訊息")
     error("這是錯誤訊息")
+    
+    # 關閉 Debug 訊息
+    from logger import Logger
+    Logger.set_debug_enabled(False)
 
-注意：
-    - Debug 訊息可以透過 Logger.set_debug_enabled(False) 關閉
-    - Error 訊息會輸出到 stderr，其他訊息輸出到 stdout
+版本：4.0.0
 """
 
 import sys
