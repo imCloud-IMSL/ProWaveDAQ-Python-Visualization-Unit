@@ -14,6 +14,8 @@ SQL 上傳器模組
 """
 
 import time
+import os
+import csv
 from datetime import datetime
 from typing import List, Optional, Dict
 import threading
@@ -337,6 +339,150 @@ class SQLUploader:
                         error(f"SQL 寫入資料失敗，已重試 {max_retries} 次，放棄此次上傳")
                         return False
             
+            return False
+
+    def upload_from_csv_file(self, csv_file_path: str, table_name: Optional[str] = None) -> bool:
+        """
+        從 CSV 檔案讀取資料並上傳至 SQL 伺服器
+        
+        此方法會讀取 CSV 檔案中的所有資料，並批次上傳至 SQL 伺服器。
+        如果未指定表名，會從 CSV 檔名自動推斷（去除路徑和 .csv 後綴）。
+        
+        Args:
+            csv_file_path: CSV 檔案路徑
+            table_name: 目標表名（可選，如果不提供則從檔名推斷）
+        
+        Returns:
+            bool: 上傳成功返回 True，失敗返回 False
+        
+        注意：
+            - CSV 檔案格式應為：Timestamp, Channel_1(X), Channel_2(Y), Channel_3(Z)
+            - 第一行會被視為標題行並跳過
+            - 使用批次插入提升效能
+            - 如果表不存在，會自動建立
+        """
+        if not os.path.exists(csv_file_path):
+            error(f"CSV 檔案不存在: {csv_file_path}")
+            return False
+        
+        # 如果未指定表名，從檔名推斷
+        if not table_name:
+            filename = os.path.basename(csv_file_path)
+            table_name = os.path.splitext(filename)[0]
+        
+        # 清理表名
+        sanitized_table_name = self._sanitize_table_name(table_name)
+        
+        # 確保表存在
+        if sanitized_table_name != self.current_table_name:
+            if not self.create_table(table_name):
+                error(f"無法建立 SQL 表: {sanitized_table_name}")
+                return False
+        
+        # 讀取 CSV 檔案
+        try:
+            rows_to_insert = []
+            with open(csv_file_path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)  # 跳過標題行
+                
+                for row in reader:
+                    if len(row) < 4:
+                        continue
+                    
+                    try:
+                        timestamp_str = row[0]
+                        channel_1 = float(row[1])
+                        channel_2 = float(row[2])
+                        channel_3 = float(row[3])
+                        
+                        # 解析時間戳記
+                        try:
+                            timestamp = datetime.fromisoformat(timestamp_str)
+                        except:
+                            timestamp = datetime.now()
+                        
+                        rows_to_insert.append((
+                            timestamp,
+                            self.label,
+                            channel_1,
+                            channel_2,
+                            channel_3
+                        ))
+                    except (ValueError, IndexError) as e:
+                        warning(f"跳過無效的 CSV 行: {row}, 錯誤: {e}")
+                        continue
+            
+            if not rows_to_insert:
+                warning(f"CSV 檔案中沒有有效資料: {csv_file_path}")
+                return True  # 檔案為空，視為成功
+            
+            # 批次上傳
+            with self.upload_lock:
+                max_retries = 3
+                retry_count = 0
+                
+                while retry_count < max_retries:
+                    try:
+                        if not self.connection:
+                            if not self._reconnect():
+                                retry_count += 1
+                                time.sleep(0.1 * retry_count)
+                                continue
+                        
+                        try:
+                            if PYMySQL_AVAILABLE:
+                                self.connection.ping(reconnect=True)
+                            else:
+                                if not self.connection.is_connected():
+                                    if not self._reconnect():
+                                        retry_count += 1
+                                        time.sleep(0.1 * retry_count)
+                                        continue
+                        except:
+                            if not self._reconnect():
+                                retry_count += 1
+                                time.sleep(0.1 * retry_count)
+                                continue
+                        
+                        if not self.cursor:
+                            self.cursor = self.connection.cursor()
+                        
+                        insert_sql = f"""
+                        INSERT INTO `{sanitized_table_name}` (timestamp, label, channel_1, channel_2, channel_3)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """
+                        
+                        # 批次插入
+                        self.cursor.executemany(insert_sql, rows_to_insert)
+                        self.connection.commit()
+                        
+                        info(f"成功從 CSV 檔案上傳 {len(rows_to_insert)} 筆資料至 SQL 表: {sanitized_table_name}")
+                        return True
+                        
+                    except Exception as e:
+                        error(f"從 CSV 檔案上傳資料失敗 (嘗試 {retry_count + 1}/{max_retries}): {e}")
+                        try:
+                            if self.connection:
+                                self.connection.rollback()
+                        except:
+                            pass
+                        
+                        self.is_connected = False
+                        retry_count += 1
+                        
+                        if retry_count < max_retries:
+                            time.sleep(0.1 * retry_count)
+                            if not self._reconnect():
+                                continue
+                        else:
+                            error(f"從 CSV 檔案上傳資料失敗，已重試 {max_retries} 次")
+                            return False
+                
+                return False
+                
+        except Exception as e:
+            error(f"讀取 CSV 檔案時發生錯誤: {e}")
             return False
 
     def close(self) -> None:
