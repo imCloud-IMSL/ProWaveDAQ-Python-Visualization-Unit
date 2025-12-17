@@ -1,6 +1,6 @@
 #!/bin/bash
 # 自動連線 OVPN 伺服器腳本
-# 功能：自動將私鑰、帳號與密碼輸入連線檔並連線
+# 功能：自動將私鑰密碼、帳號與密碼輸入連線檔並連線
 
 # 設定顏色輸出
 RED='\033[0;31m'
@@ -17,7 +17,7 @@ TEMP_OVPN_FILE="/tmp/imCloud_auto.ovpn"
 show_usage() {
     echo "使用方法："
     echo "  $0                    # 使用設定檔連線"
-    echo "  $0 --setup            # 設定連線資訊（私鑰、帳號、密碼）"
+    echo "  $0 --setup            # 設定連線資訊（私鑰密碼、帳號、密碼）"
     echo "  $0 --disconnect       # 中斷連線"
     echo ""
     echo "設定檔位置：$CONFIG_FILE"
@@ -44,24 +44,17 @@ setup_connection() {
         source "$CONFIG_FILE"
     fi
     
-    # 讀取私鑰路徑
-    if [ -z "$PRIVATE_KEY_PATH" ]; then
-        read -p "請輸入私鑰檔案路徑（或按 Enter 使用預設：~/.ssh/id_rsa）: " key_path
-        PRIVATE_KEY_PATH="${key_path:-~/.ssh/id_rsa}"
+    # 讀取私鑰密碼
+    if [ -z "$PRIVATE_KEY_PASSWORD" ]; then
+        read -sp "請輸入私鑰密碼: " key_password
+        echo ""
+        PRIVATE_KEY_PASSWORD="$key_password"
     else
-        read -p "請輸入私鑰檔案路徑（目前：$PRIVATE_KEY_PATH，按 Enter 保持不變）: " key_path
-        if [ -n "$key_path" ]; then
-            PRIVATE_KEY_PATH="$key_path"
+        read -sp "請輸入私鑰密碼（按 Enter 保持不變）: " key_password
+        echo ""
+        if [ -n "$key_password" ]; then
+            PRIVATE_KEY_PASSWORD="$key_password"
         fi
-    fi
-    
-    # 展開 ~ 路徑
-    PRIVATE_KEY_PATH="${PRIVATE_KEY_PATH/#\~/$HOME}"
-    
-    # 檢查私鑰檔案是否存在
-    if [ ! -f "$PRIVATE_KEY_PATH" ]; then
-        echo -e "${RED}錯誤：私鑰檔案不存在：$PRIVATE_KEY_PATH${NC}"
-        exit 1
     fi
     
     # 讀取帳號
@@ -104,7 +97,7 @@ setup_connection() {
 # OVPN 連線設定檔
 # 此檔案包含敏感資訊，請勿分享或提交到版本控制系統
 
-PRIVATE_KEY_PATH="$PRIVATE_KEY_PATH"
+PRIVATE_KEY_PASSWORD="$PRIVATE_KEY_PASSWORD"
 OVPN_USERNAME="$OVPN_USERNAME"
 OVPN_PASSWORD="$OVPN_PASSWORD"
 OVPN_SERVER="$OVPN_SERVER"
@@ -149,18 +142,6 @@ EOF
     # 複製原始 OVPN 檔案到臨時檔案
     cp "$OVPN_FILE" "$TEMP_OVPN_FILE"
     
-    # 讀取私鑰內容
-    if [ -f "$PRIVATE_KEY_PATH" ]; then
-        # 在 OVPN 檔案中添加私鑰
-        echo "" >> "$TEMP_OVPN_FILE"
-        echo "<key>" >> "$TEMP_OVPN_FILE"
-        cat "$PRIVATE_KEY_PATH" >> "$TEMP_OVPN_FILE"
-        echo "</key>" >> "$TEMP_OVPN_FILE"
-    else
-        echo -e "${RED}錯誤：私鑰檔案不存在：$PRIVATE_KEY_PATH${NC}"
-        exit 1
-    fi
-    
     # 建立認證檔案（帳號和密碼）
     AUTH_FILE="/tmp/ovpn_auth_$$.txt"
     echo "$OVPN_USERNAME" > "$AUTH_FILE"
@@ -170,7 +151,12 @@ EOF
     # 在 OVPN 檔案中添加認證設定
     echo "auth-user-pass $AUTH_FILE" >> "$TEMP_OVPN_FILE"
     
-    echo "$AUTH_FILE"  # 返回認證檔案路徑，以便後續清理
+    # 建立私鑰密碼檔案
+    KEY_PASS_FILE="/tmp/ovpn_keypass_$$.txt"
+    echo "$PRIVATE_KEY_PASSWORD" > "$KEY_PASS_FILE"
+    chmod 600 "$KEY_PASS_FILE"
+    
+    echo "$AUTH_FILE|$KEY_PASS_FILE"  # 返回認證檔案和私鑰密碼檔案路徑，以便後續清理
 }
 
 # 函數：連線到 OVPN
@@ -186,7 +172,7 @@ connect_ovpn() {
     source "$CONFIG_FILE"
     
     # 檢查必要變數
-    if [ -z "$PRIVATE_KEY_PATH" ] || [ -z "$OVPN_USERNAME" ] || [ -z "$OVPN_PASSWORD" ]; then
+    if [ -z "$PRIVATE_KEY_PASSWORD" ] || [ -z "$OVPN_USERNAME" ] || [ -z "$OVPN_PASSWORD" ]; then
         echo -e "${RED}錯誤：設定檔不完整${NC}"
         echo "請執行：$0 --setup"
         exit 1
@@ -206,19 +192,22 @@ connect_ovpn() {
     echo -e "${GREEN}正在建立 OVPN 連線...${NC}"
     
     # 建立臨時 OVPN 檔案
-    AUTH_FILE=$(create_temp_ovpn)
+    FILES=$(create_temp_ovpn)
+    AUTH_FILE=$(echo "$FILES" | cut -d'|' -f1)
+    KEY_PASS_FILE=$(echo "$FILES" | cut -d'|' -f2)
     
     # 執行 OVPN 連線（背景執行）
     echo "使用設定檔：$TEMP_OVPN_FILE"
     echo "認證檔案：$AUTH_FILE"
+    echo "私鑰密碼檔案：$KEY_PASS_FILE"
     echo ""
     
     # 以 root 權限執行（如果需要）
     if [ "$EUID" -eq 0 ]; then
-        openvpn --config "$TEMP_OVPN_FILE" --daemon
+        openvpn --config "$TEMP_OVPN_FILE" --askpass "$KEY_PASS_FILE" --daemon
     else
         echo "嘗試以 sudo 權限執行..."
-        sudo openvpn --config "$TEMP_OVPN_FILE" --daemon
+        sudo openvpn --config "$TEMP_OVPN_FILE" --askpass "$KEY_PASS_FILE" --daemon
     fi
     
     # 等待連線建立
@@ -230,15 +219,15 @@ connect_ovpn() {
         echo "使用 'sudo killall openvpn' 或執行 '$0 --disconnect' 來中斷連線"
         
         # 清理臨時認證檔案（延遲清理，確保 OVPN 已讀取）
-        (sleep 5 && rm -f "$AUTH_FILE") &
+        (sleep 5 && rm -f "$AUTH_FILE" "$KEY_PASS_FILE") &
     else
         echo -e "${RED}錯誤：OVPN 連線啟動失敗${NC}"
         echo "請檢查："
         echo "  1. OVPN 設定檔是否正確"
-        echo "  2. 私鑰檔案是否正確"
+        echo "  2. 私鑰密碼是否正確"
         echo "  3. 帳號和密碼是否正確"
         echo "  4. 系統日誌：sudo journalctl -u openvpn -n 50"
-        rm -f "$AUTH_FILE" "$TEMP_OVPN_FILE"
+        rm -f "$AUTH_FILE" "$KEY_PASS_FILE" "$TEMP_OVPN_FILE"
         exit 1
     fi
 }
@@ -267,7 +256,7 @@ disconnect_ovpn() {
     fi
     
     # 清理臨時檔案
-    rm -f /tmp/ovpn_auth_*.txt "$TEMP_OVPN_FILE"
+    rm -f /tmp/ovpn_auth_*.txt /tmp/ovpn_keypass_*.txt "$TEMP_OVPN_FILE"
 }
 
 # 主程式
