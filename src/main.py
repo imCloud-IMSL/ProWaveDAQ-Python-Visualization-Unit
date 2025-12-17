@@ -60,7 +60,6 @@ sql_upload_interval = 0
 sql_temp_dir = None
 sql_current_temp_file = None
 sql_temp_file_lock = threading.Lock()
-sql_upload_thread: Optional[threading.Thread] = None
 sql_sample_count = 0
 sql_start_time: Optional[datetime] = None
 last_data_request_time = 0
@@ -398,7 +397,7 @@ def start_collection():
     global is_collecting, collection_thread, daq_instance, csv_writer_instance
     global target_size, current_data_size, realtime_data, data_counter
     global sql_uploader_instance, sql_target_size, sql_current_data_size, sql_enabled, sql_config
-    global sql_upload_interval, sql_temp_dir, sql_current_temp_file, sql_upload_thread
+    global sql_upload_interval, sql_temp_dir, sql_current_temp_file
     global sql_start_time, sql_sample_count, last_data_request_time
 
     if is_collecting:
@@ -479,7 +478,6 @@ def start_collection():
         expected_samples_per_second = sample_rate * channels
         target_size = save_unit * expected_samples_per_second
         sql_target_size = sql_upload_interval * expected_samples_per_second
-        sql_buffer_max_size = min(sql_target_size * 2, 10_000_000)
 
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         folder = f"{timestamp}_{label}"
@@ -494,6 +492,7 @@ def start_collection():
         sql_current_temp_file = None
         sql_start_time = datetime.now()  # 初始化起始時間
         sql_sample_count = 0  # 初始化樣本計數
+        sql_current_data_size = 0  # 初始化 SQL 資料量計數器
         
         if sql_enabled:
             try:
@@ -514,14 +513,6 @@ def start_collection():
                     writer.writerow(['Timestamp', 'Channel_1(X)', 'Channel_2(Y)', 'Channel_3(Z)'])
                 
                 info(f"SQL 暫存檔案已建立: {temp_filename}")
-                
-                # 啟動定時上傳執行緒
-                sql_upload_thread = threading.Thread(
-                    target=sql_upload_timer_loop, 
-                    args=(sql_upload_interval,),
-                    daemon=True
-                )
-                sql_upload_thread.start()
                 
             except Exception as e:
                 return jsonify({'success': False, 'message': f'SQL 上傳器初始化失敗: {str(e)}'})
@@ -578,77 +569,87 @@ def stop_collection():
         if daq_instance:
             daq_instance.stop_reading()
 
-        time.sleep(0.2)  # 等待定時器執行緒和收集執行緒完成
+        # 立即返回成功回應，讓前端知道已停止
+        # 剩餘的上傳工作在背景執行
+        response_message = '資料收集已停止'
         
-        # 處理 SQL 暫存檔案
-        if sql_uploader_instance and sql_enabled and sql_temp_dir:
-            try:
-                # 上傳當前暫存檔案
-                with sql_temp_file_lock:
-                    current_temp = sql_current_temp_file
-                
-                if current_temp and os.path.exists(current_temp):
-                    # 從檔名推斷表名
-                    if csv_writer_instance:
-                        csv_filename = csv_writer_instance.get_current_filename()
-                        if csv_filename:
-                            table_name = csv_filename
-                        else:
-                            table_name = None
-                    else:
-                        table_name = None
+        # 在背景執行緒中處理剩餘的上傳工作（避免阻塞前端）
+        def finalize_upload():
+            time.sleep(0.1)  # 等待收集執行緒完成當前處理
+            
+            # 處理 SQL 暫存檔案
+            if sql_uploader_instance and sql_enabled and sql_temp_dir:
+                try:
+                    # 上傳當前暫存檔案
+                    with sql_temp_file_lock:
+                        current_temp = sql_current_temp_file
                     
-                    if sql_uploader_instance.upload_from_csv_file(current_temp, table_name):
-                        try:
-                            os.remove(current_temp)
-                            info(f"停止時已上傳並刪除暫存檔案: {os.path.basename(current_temp)}")
-                        except Exception as e:
-                            warning(f"刪除暫存檔案失敗: {e}")
-                    else:
-                        error(f"停止時上傳暫存檔案失敗: {os.path.basename(current_temp)}")
-                
-                # 檢查並上傳所有剩餘的暫存檔案
-                if os.path.exists(sql_temp_dir):
-                    temp_files = [f for f in os.listdir(sql_temp_dir) if f.endswith('_sql_temp.csv')]
-                    for temp_file in temp_files:
-                        temp_file_path = os.path.join(sql_temp_dir, temp_file)
-                        if os.path.exists(temp_file_path):
-                            # 從檔名推斷表名
-                            if csv_writer_instance:
-                                csv_filename = csv_writer_instance.get_current_filename()
-                                if csv_filename:
-                                    table_name = csv_filename
-                                else:
-                                    table_name = None
+                    if current_temp and os.path.exists(current_temp):
+                        # 從檔名推斷表名
+                        if csv_writer_instance:
+                            csv_filename = csv_writer_instance.get_current_filename()
+                            if csv_filename:
+                                table_name = csv_filename
                             else:
                                 table_name = None
-                            
-                            if sql_uploader_instance.upload_from_csv_file(temp_file_path, table_name):
-                                try:
-                                    os.remove(temp_file_path)
-                                    info(f"停止時已上傳並刪除暫存檔案: {temp_file}")
-                                except Exception as e:
-                                    warning(f"刪除暫存檔案失敗: {e}")
-                            else:
-                                error(f"停止時上傳暫存檔案失敗: {temp_file}")
-                    
-                    # 如果目錄為空，嘗試刪除目錄
-                    try:
-                        if not os.listdir(sql_temp_dir):
-                            os.rmdir(sql_temp_dir)
-                    except:
-                        pass
+                        else:
+                            table_name = None
                         
-            except Exception as e:
-                error(f"停止時處理 SQL 暫存檔案發生錯誤: {e}")
+                        if sql_uploader_instance.upload_from_csv_file(current_temp, table_name):
+                            try:
+                                os.remove(current_temp)
+                                info(f"停止時已上傳並刪除暫存檔案: {os.path.basename(current_temp)}")
+                            except Exception as e:
+                                warning(f"刪除暫存檔案失敗: {e}")
+                        else:
+                            error(f"停止時上傳暫存檔案失敗: {os.path.basename(current_temp)}")
+                    
+                    # 檢查並上傳所有剩餘的暫存檔案
+                    if os.path.exists(sql_temp_dir):
+                        temp_files = [f for f in os.listdir(sql_temp_dir) if f.endswith('_sql_temp.csv')]
+                        for temp_file in temp_files:
+                            temp_file_path = os.path.join(sql_temp_dir, temp_file)
+                            if os.path.exists(temp_file_path):
+                                # 從檔名推斷表名
+                                if csv_writer_instance:
+                                    csv_filename = csv_writer_instance.get_current_filename()
+                                    if csv_filename:
+                                        table_name = csv_filename
+                                    else:
+                                        table_name = None
+                                else:
+                                    table_name = None
+                                
+                                if sql_uploader_instance.upload_from_csv_file(temp_file_path, table_name):
+                                    try:
+                                        os.remove(temp_file_path)
+                                        info(f"停止時已上傳並刪除暫存檔案: {temp_file}")
+                                    except Exception as e:
+                                        warning(f"刪除暫存檔案失敗: {e}")
+                                else:
+                                    error(f"停止時上傳暫存檔案失敗: {temp_file}")
+                        
+                        # 如果目錄為空，嘗試刪除目錄
+                        try:
+                            if not os.listdir(sql_temp_dir):
+                                os.rmdir(sql_temp_dir)
+                        except:
+                            pass
+                            
+                except Exception as e:
+                    error(f"停止時處理 SQL 暫存檔案發生錯誤: {e}")
 
-        if csv_writer_instance:
-            csv_writer_instance.close()
+            if csv_writer_instance:
+                csv_writer_instance.close()
 
-        if sql_uploader_instance:
-            sql_uploader_instance.close()
-
-        return jsonify({'success': True, 'message': '資料收集已停止'})
+            if sql_uploader_instance:
+                sql_uploader_instance.close()
+        
+        # 在背景執行緒中執行最終清理工作
+        cleanup_thread = threading.Thread(target=finalize_upload, daemon=True)
+        cleanup_thread.start()
+        
+        return jsonify({'success': True, 'message': response_message})
 
     except Exception as e:
         return jsonify({'success': False, 'message': f'停止失敗: {str(e)}'})
@@ -859,78 +860,84 @@ def _write_to_temp_file(data: List[float], sample_rate: int, start_time: datetim
         return sample_count
 
 
-def sql_upload_timer_loop(interval: float):
+def _upload_temp_file_if_needed():
     """
-    SQL 上傳定時器迴圈（在獨立執行緒中執行）
+    檢查並上傳暫存檔案（如果資料量達到門檻）
     
-    此函數會定期檢查並上傳暫存檔案到 SQL 伺服器。
-    當到達指定時間間隔時，會：
-    1. 關閉當前暫存檔案
-    2. 上傳該檔案到 SQL
-    3. 刪除暫存檔案
-    4. 建立新的暫存檔案
-    
-    Args:
-        interval: 上傳間隔（秒）
+    當累積的資料量達到 sql_target_size 時，會：
+    1. 上傳當前暫存檔案到 SQL
+    2. 刪除暫存檔案
+    3. 建立新的暫存檔案
+    4. 重置資料量計數器（保留超出部分的資料量）
     """
-    global sql_uploader_instance, sql_current_temp_file, sql_temp_dir, is_collecting, csv_writer_instance
+    global sql_uploader_instance, sql_current_temp_file, sql_temp_dir, csv_writer_instance
+    global sql_current_data_size, sql_target_size
     
-    if interval <= 0:
-        return
+    if not sql_uploader_instance or not sql_current_temp_file:
+        return False
     
-    last_upload_time = time.time()
+    # 檢查資料量是否達到門檻
+    if sql_current_data_size < sql_target_size:
+        return False
     
-    while is_collecting:
-        try:
-            current_time = time.time()
-            elapsed = current_time - last_upload_time
+    # 資料量達到門檻，準備上傳
+    with sql_temp_file_lock:
+        temp_file_to_upload = sql_current_temp_file
+    
+    if not temp_file_to_upload or not os.path.exists(temp_file_to_upload):
+        return False
+    
+    try:
+        # 記錄當前資料量（用於日誌）
+        current_data_size_before_upload = sql_current_data_size
+        
+        # 從檔名推斷表名（使用對應的 CSV 檔名）
+        if csv_writer_instance:
+            csv_filename = csv_writer_instance.get_current_filename()
+            if csv_filename:
+                table_name = csv_filename
+            else:
+                # 如果沒有 CSV 檔名，使用暫存檔名
+                table_name = os.path.splitext(os.path.basename(temp_file_to_upload))[0]
+        else:
+            table_name = None
+        
+        # 上傳檔案
+        if sql_uploader_instance.upload_from_csv_file(temp_file_to_upload, table_name):
+            # 計算筆數（資料點數 / 通道數）
+            channels = 3
+            rows_count = current_data_size_before_upload // channels
+            target_rows = sql_target_size // channels
             
-            if elapsed >= interval:
-                # 時間到了，上傳當前暫存檔案
-                with sql_temp_file_lock:
-                    temp_file_to_upload = sql_current_temp_file
-                
-                if temp_file_to_upload and os.path.exists(temp_file_to_upload):
-                    # 關閉檔案（確保資料已寫入）
-                    try:
-                        # 檔案應該已經關閉，這裡只是確保
-                        pass
-                    except:
-                        pass
-                    
-                    # 上傳檔案
-                    if sql_uploader_instance:
-                        # 從檔名推斷表名（使用對應的 CSV 檔名）
-                        if csv_writer_instance:
-                            csv_filename = csv_writer_instance.get_current_filename()
-                            if csv_filename:
-                                table_name = csv_filename
-                            else:
-                                # 如果沒有 CSV 檔名，使用暫存檔名
-                                table_name = os.path.splitext(os.path.basename(temp_file_to_upload))[0]
-                        else:
-                            table_name = None
-                        
-                        if sql_uploader_instance.upload_from_csv_file(temp_file_to_upload, table_name):
-                            # 上傳成功，刪除暫存檔
-                            try:
-                                os.remove(temp_file_to_upload)
-                                info(f"暫存檔案已上傳並刪除: {os.path.basename(temp_file_to_upload)}")
-                            except Exception as e:
-                                warning(f"刪除暫存檔案失敗: {e}")
-                        else:
-                            error(f"上傳暫存檔案失敗: {os.path.basename(temp_file_to_upload)}")
-                            # 上傳失敗，保留檔案等待下次重試
-                
-                # 建立新的暫存檔案
-                _create_new_temp_file()
-                last_upload_time = current_time
+            # 上傳成功，刪除暫存檔
+            try:
+                os.remove(temp_file_to_upload)
+                info(f"暫存檔案已上傳並刪除: {os.path.basename(temp_file_to_upload)} (筆數: {rows_count} 筆, 目標: {target_rows} 筆)")
+            except Exception as e:
+                warning(f"刪除暫存檔案失敗: {e}")
             
-            time.sleep(0.1)  # 每 100ms 檢查一次
+            # 建立新的暫存檔案
+            _create_new_temp_file()
             
-        except Exception as e:
-            error(f"SQL 上傳定時器迴圈錯誤: {e}")
-            time.sleep(1)
+            # 計算超出部分的資料量（用於下一個暫存檔案）
+            excess_data_size = current_data_size_before_upload - sql_target_size
+            
+            # 重置資料量計數器，保留超出部分的資料量
+            sql_current_data_size = excess_data_size
+            
+            if excess_data_size > 0:
+                excess_rows = excess_data_size // channels
+                debug(f"保留超出部分的資料量: {excess_rows} 筆 ({excess_data_size} 個資料點) 到新暫存檔案")
+            
+            return True
+        else:
+            error(f"上傳暫存檔案失敗: {os.path.basename(temp_file_to_upload)}")
+            # 上傳失敗，保留檔案等待下次重試
+            return False
+            
+    except Exception as e:
+        error(f"上傳暫存檔案時發生錯誤: {e}")
+        return False
 
 
 def collection_loop():
@@ -959,7 +966,7 @@ def collection_loop():
     """
     global is_collecting, daq_instance, csv_writer_instance, sql_uploader_instance
     global target_size, current_data_size, sql_target_size, sql_current_data_size, sql_enabled
-    global sql_data_buffer, sql_buffer_max_size, sql_sample_count, sql_start_time
+    global sql_sample_count, sql_start_time
     global sql_current_temp_file, sql_temp_dir
     
     channels = 3
@@ -968,6 +975,7 @@ def collection_loop():
     if sql_enabled and sql_start_time is None:
         sql_start_time = datetime.now()
         sql_sample_count = 0
+        sql_current_data_size = 0
 
     while is_collecting:
         try:
@@ -1019,11 +1027,56 @@ def collection_loop():
                             current_data_size = 0
                 if sql_uploader_instance and sql_enabled and sql_current_temp_file:
                     sql_data = original_data.copy()
+                    sql_data_size = len(sql_data)
                     
                     # 寫入暫存檔案
                     if sql_start_time is not None:
                         sample_rate = csv_writer_instance.sample_rate if csv_writer_instance else 7812
-                        sql_sample_count = _write_to_temp_file(sql_data, sample_rate, sql_start_time, sql_sample_count)
+                        channels = 3
+                        
+                        # 處理資料寫入，確保不超過目標值
+                        remaining_data = sql_data
+                        
+                        while len(remaining_data) > 0:
+                            # 計算當前檔案的剩餘空間
+                            remaining_space = sql_target_size - sql_current_data_size
+                            
+                            if remaining_space <= 0:
+                                # 當前檔案已滿，先上傳
+                                if not _upload_temp_file_if_needed():
+                                    # 上傳失敗，將剩餘資料寫入當前檔案（避免資料遺失）
+                                    sql_sample_count = _write_to_temp_file(remaining_data, sample_rate, sql_start_time, sql_sample_count)
+                                    sql_current_data_size += len(remaining_data)
+                                    break
+                                # 上傳成功，重新計算剩餘空間
+                                remaining_space = sql_target_size - sql_current_data_size
+                            
+                            # 計算可以寫入的資料量（確保是 channels 的倍數）
+                            write_size = min(len(remaining_data), remaining_space)
+                            write_size = (write_size // channels) * channels
+                            
+                            if write_size > 0:
+                                # 寫入部分資料到當前檔案
+                                data_to_write = remaining_data[:write_size]
+                                sql_sample_count = _write_to_temp_file(data_to_write, sample_rate, sql_start_time, sql_sample_count)
+                                sql_current_data_size += write_size
+                                
+                                # 更新剩餘資料
+                                remaining_data = remaining_data[write_size:]
+                                
+                                # 檢查當前檔案是否已滿
+                                if sql_current_data_size >= sql_target_size:
+                                    if not _upload_temp_file_if_needed():
+                                        # 上傳失敗，跳出迴圈
+                                        break
+                            else:
+                                # 剩餘空間不足一個完整樣本，先上傳
+                                if not _upload_temp_file_if_needed():
+                                    # 上傳失敗，將剩餘資料寫入當前檔案（避免資料遺失）
+                                    sql_sample_count = _write_to_temp_file(remaining_data, sample_rate, sql_start_time, sql_sample_count)
+                                    sql_current_data_size += len(remaining_data)
+                                    break
+                                # 上傳成功，繼續處理剩餘資料
 
                 data = daq_instance.get_data()
 
