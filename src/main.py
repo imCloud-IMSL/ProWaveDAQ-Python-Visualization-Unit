@@ -398,6 +398,8 @@ def start_collection():
     global is_collecting, collection_thread, daq_instance, csv_writer_instance
     global target_size, current_data_size, realtime_data, data_counter
     global sql_uploader_instance, sql_target_size, sql_current_data_size, sql_enabled, sql_config
+    global sql_upload_interval, sql_temp_dir, sql_current_temp_file, sql_upload_thread
+    global sql_start_time, sql_sample_count, last_data_request_time
 
     if is_collecting:
         return jsonify({'success': False, 'message': '資料收集已在執行中'})
@@ -416,7 +418,6 @@ def start_collection():
             sql_current_data_size = 0
             sql_data_buffer = []
         with data_request_lock:
-            global last_data_request_time, sql_sample_count, sql_start_time
             last_data_request_time = 0
             sql_sample_count = 0
             sql_start_time = None
@@ -429,7 +430,6 @@ def start_collection():
             return jsonify({'success': False, 'message': '無法讀取 Master.ini'})
 
         save_unit = config.getint('SaveUnit', 'second', fallback=5)
-        global sql_upload_interval
         sql_upload_interval = config.getint('SaveUnit', 'sql_upload_interval', fallback=0)
         if sql_upload_interval <= 0:
             sql_upload_interval = save_unit
@@ -489,7 +489,6 @@ def start_collection():
         csv_writer_instance = CSVWriter(channels, output_path, label, sample_rate)
 
         # 初始化 SQL 上傳相關變數
-        global sql_upload_interval, sql_temp_dir, sql_current_temp_file, sql_upload_thread, sql_start_time, sql_sample_count
         sql_uploader_instance = None
         sql_temp_dir = None
         sql_current_temp_file = None
