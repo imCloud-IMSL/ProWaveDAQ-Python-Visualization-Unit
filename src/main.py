@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 ProWaveDAQ 即時資料可視化系統 - 主控制程式
-整合 DAQ、Web、CSV 三者運作
+整合 DAQ、Web、CSV、SQL 四者運作
 
-版本：4.0.0
+版本：6.0.0
 """
 
 import os
 import sys
 import time
 import threading
+import queue
 import configparser
 import logging
 import argparse
@@ -44,6 +45,8 @@ realtime_data: List[float] = []
 data_lock = threading.Lock()
 is_collecting = False
 collection_thread: Optional[threading.Thread] = None
+csv_writer_thread: Optional[threading.Thread] = None
+sql_writer_thread: Optional[threading.Thread] = None
 daq_instance: Optional[ProWaveDAQ] = None
 csv_writer_instance: Optional[CSVWriter] = None
 sql_uploader_instance: Optional[SQLUploader] = None
@@ -65,6 +68,10 @@ sql_start_time: Optional[datetime] = None
 last_data_request_time = 0
 data_request_lock = threading.Lock()
 DATA_REQUEST_TIMEOUT = 5.0
+
+# 資料佇列（用於執行緒間通訊）
+csv_data_queue: "queue.Queue[List[float]]" = queue.Queue(maxsize=1000)
+sql_data_queue: "queue.Queue[List[float]]" = queue.Queue(maxsize=1000)
 
 
 def update_realtime_data(data: List[float]) -> None:
@@ -403,11 +410,13 @@ def start_collection():
         - SQL 設定可以從 sql.ini 讀取，也可以由前端提供（覆蓋 INI 設定）
         - 輸出目錄格式：output/ProWaveDAQ/{timestamp}_{label}/
     """
-    global is_collecting, collection_thread, daq_instance, csv_writer_instance
+    global is_collecting, collection_thread, csv_writer_thread, sql_writer_thread
+    global daq_instance, csv_writer_instance
     global target_size, current_data_size, realtime_data, data_counter
     global sql_uploader_instance, sql_target_size, sql_current_data_size, sql_enabled, sql_config
     global sql_upload_interval, sql_temp_dir, sql_current_temp_file
     global sql_start_time, sql_sample_count, last_data_request_time
+    global csv_data_queue, sql_data_queue
 
     if is_collecting:
         return jsonify({'success': False, 'message': '資料收集已在執行中'})
@@ -536,10 +545,25 @@ def start_collection():
                 return jsonify({'success': False, 'message': f'SQL 上傳器初始化失敗: {str(e)}'})
 
         is_collecting = True
+        
+        # 啟動資料收集執行緒（負責從 DAQ 讀取資料並分發到各佇列）
         collection_thread = threading.Thread(
             target=collection_loop, daemon=True)
         collection_thread.start()
-
+        
+        # 啟動 CSV 寫入執行緒（如果啟用 CSV）
+        if csv_writer_instance:
+            csv_writer_thread = threading.Thread(
+                target=csv_writer_loop, daemon=True)
+            csv_writer_thread.start()
+        
+        # 啟動 SQL 寫入執行緒（如果啟用 SQL）
+        if sql_uploader_instance and sql_enabled:
+            sql_writer_thread = threading.Thread(
+                target=sql_writer_loop, daemon=True)
+            sql_writer_thread.start()
+        
+        # 啟動 DAQ 讀取執行緒
         daq_instance.start_reading()
 
         csv_status = '' if csv_enabled else ', CSV 儲存: 已停用'
@@ -575,7 +599,8 @@ def stop_collection():
         - 停止時會自動上傳 SQL 緩衝區中的剩餘資料（即使未達到門檻）
         - 所有檔案和連線會安全關閉
     """
-    global is_collecting, daq_instance, csv_writer_instance, sql_uploader_instance
+    global is_collecting, collection_thread, csv_writer_thread, sql_writer_thread
+    global daq_instance, csv_writer_instance, sql_uploader_instance
     global current_data_size, sql_current_data_size, sql_enabled
     global sql_temp_dir, sql_current_temp_file
 
@@ -594,7 +619,16 @@ def stop_collection():
         
         # 在背景執行緒中處理剩餘的上傳工作（避免阻塞前端）
         def finalize_upload():
-            time.sleep(0.1)  # 等待收集執行緒完成當前處理
+            # 等待所有執行緒完成處理佇列中的資料
+            time.sleep(0.5)  # 等待收集執行緒完成當前處理
+            
+            # 等待 CSV 和 SQL 執行緒處理完佇列中的資料
+            if csv_writer_thread and csv_writer_thread.is_alive():
+                csv_data_queue.join()  # 等待佇列處理完成
+            if sql_writer_thread and sql_writer_thread.is_alive():
+                sql_data_queue.join()  # 等待佇列處理完成
+            
+            time.sleep(0.2)  # 額外等待時間確保所有寫入完成
             
             # 處理 SQL 暫存檔案
             if sql_uploader_instance and sql_enabled and sql_temp_dir:
@@ -963,156 +997,43 @@ def collection_loop():
     """
     資料收集主迴圈（在獨立執行緒中執行）
     
-    此函數是整個系統的核心資料處理迴圈，負責：
+    此函數負責：
     1. 從 DAQ 設備讀取資料（非阻塞方式）
     2. 更新即時顯示緩衝區（智慧緩衝區更新機制）
-    3. 將資料寫入 CSV 檔案（自動分檔，確保樣本邊界，如果啟用）
-    4. 將資料上傳至 SQL 伺服器（如果啟用，獨立緩衝區）
+    3. 將資料放入 CSV 和 SQL 的佇列，由各自的執行緒處理
     
     資料流程：
-        DAQ 設備 → DAQ 佇列 → collection_loop → CSV/SQL/即時顯示
-    
-    重要設計原則：
-        - CSV 分檔：確保切斷位置在樣本邊界（3的倍數），避免通道錯位
-        - SQL 上傳：使用獨立的緩衝區，與 CSV 分檔邏輯完全獨立
-        - 記憶體保護：SQL 緩衝區有最大大小限制，超過時強制上傳
-        - 資料保護：SQL 上傳失敗時保留資料在緩衝區，等待重試
+        DAQ 設備 → DAQ 佇列 → collection_loop → 即時顯示緩衝區 + CSV 佇列 + SQL 佇列
     
     注意：
         - 此函數在背景執行緒中執行，不會阻塞主執行緒
         - 使用非阻塞方式從 DAQ 取得資料，避免長時間等待
+        - CSV 和 SQL 寫入由各自的獨立執行緒處理
         - 每次處理後會短暫休息（10ms），避免 CPU 過載
-        - CSV 寫入是可選的，如果 csv_writer_instance 為 None，則跳過 CSV 寫入
     """
-    global is_collecting, daq_instance, csv_writer_instance, sql_uploader_instance
-    global target_size, current_data_size, sql_target_size, sql_current_data_size, sql_enabled
-    global sql_sample_count, sql_start_time
-    global sql_current_temp_file, sql_temp_dir
-    
-    channels = 3
-    
-    # 從 DAQ 取得取樣率（如果 CSV writer 不存在）
-    sample_rate = 7812  # 預設值
-    if daq_instance:
-        try:
-            sample_rate = daq_instance.get_sample_rate()
-        except:
-            pass
-    
-    # 初始化 SQL 樣本計數和起始時間
-    if sql_enabled and sql_start_time is None:
-        sql_start_time = datetime.now()
-        sql_sample_count = 0
-        sql_current_data_size = 0
+    global is_collecting, daq_instance, csv_data_queue, sql_data_queue
 
     while is_collecting:
         try:
             data = daq_instance.get_data()
 
             while data and len(data) > 0:
-                original_data = data.copy()
-                data_size = len(data)
-
+                # 更新即時顯示緩衝區
                 update_realtime_data(data)
+                
+                # 將資料放入 CSV 佇列（如果啟用 CSV）
                 if csv_writer_instance:
-                    current_data_size += data_size
-
-                    if current_data_size < target_size:
-                        csv_writer_instance.add_data_block(data)
-                    else:
-                        data_actual_size = data_size
-                        empty_space = target_size - (current_data_size - data_actual_size)
-                        empty_space = (empty_space // channels) * channels
-
-                        while current_data_size >= target_size:
-                            batch = data[:empty_space]
-                            csv_writer_instance.add_data_block(batch)
-                            csv_writer_instance.update_filename()
-                            
-                            if sql_uploader_instance and sql_enabled:
-                                csv_filename = csv_writer_instance.get_current_filename() if csv_writer_instance else None
-                                if csv_filename:
-                                    if sql_uploader_instance.create_table(csv_filename):
-                                        info(f"SQL 表已建立，對應 CSV: {csv_filename}")
-                                    else:
-                                        warning(f"SQL 表建立失敗，對應 CSV: {csv_filename}")
-
-                            current_data_size -= target_size
-                            
-                            if empty_space < data_actual_size:
-                                data = data[empty_space:]
-                                data_actual_size = len(data)
-                                empty_space = target_size
-                                empty_space = (empty_space // channels) * channels
-                            else:
-                                break
-
-                        pending = data_actual_size
-                        if pending:
-                            csv_writer_instance.add_data_block(data)
-                            current_data_size = pending
-                        else:
-                            current_data_size = 0
-                if sql_uploader_instance and sql_enabled and sql_current_temp_file:
-                    sql_data = original_data.copy()
-                    sql_data_size = len(sql_data)
-                    
-                    # 寫入暫存檔案
-                    if sql_start_time is not None:
-                        # 如果 CSV writer 不存在，使用 DAQ 的取樣率或預設值
-                        if csv_writer_instance:
-                            sample_rate = csv_writer_instance.sample_rate
-                        else:
-                            # 從 DAQ 取得取樣率
-                            try:
-                                sample_rate = daq_instance.get_sample_rate() if daq_instance else 7812
-                            except:
-                                sample_rate = 7812
-                        channels = 3
-                        
-                        # 處理資料寫入，確保不超過目標值
-                        remaining_data = sql_data
-                        
-                        while len(remaining_data) > 0:
-                            # 計算當前檔案的剩餘空間
-                            remaining_space = sql_target_size - sql_current_data_size
-                            
-                            if remaining_space <= 0:
-                                # 當前檔案已滿，先上傳
-                                if not _upload_temp_file_if_needed():
-                                    # 上傳失敗，將剩餘資料寫入當前檔案（避免資料遺失）
-                                    sql_sample_count = _write_to_temp_file(remaining_data, sample_rate, sql_start_time, sql_sample_count)
-                                    sql_current_data_size += len(remaining_data)
-                                    break
-                                # 上傳成功，重新計算剩餘空間
-                                remaining_space = sql_target_size - sql_current_data_size
-                            
-                            # 計算可以寫入的資料量（確保是 channels 的倍數）
-                            write_size = min(len(remaining_data), remaining_space)
-                            write_size = (write_size // channels) * channels
-                            
-                            if write_size > 0:
-                                # 寫入部分資料到當前檔案
-                                data_to_write = remaining_data[:write_size]
-                                sql_sample_count = _write_to_temp_file(data_to_write, sample_rate, sql_start_time, sql_sample_count)
-                                sql_current_data_size += write_size
-                                
-                                # 更新剩餘資料
-                                remaining_data = remaining_data[write_size:]
-                                
-                                # 檢查當前檔案是否已滿
-                                if sql_current_data_size >= sql_target_size:
-                                    if not _upload_temp_file_if_needed():
-                                        # 上傳失敗，跳出迴圈
-                                        break
-                            else:
-                                # 剩餘空間不足一個完整樣本，先上傳
-                                if not _upload_temp_file_if_needed():
-                                    # 上傳失敗，將剩餘資料寫入當前檔案（避免資料遺失）
-                                    sql_sample_count = _write_to_temp_file(remaining_data, sample_rate, sql_start_time, sql_sample_count)
-                                    sql_current_data_size += len(remaining_data)
-                                    break
-                                # 上傳成功，繼續處理剩餘資料
+                    try:
+                        csv_data_queue.put(data.copy(), block=False)
+                    except queue.Full:
+                        warning("CSV 資料佇列已滿，跳過此筆資料")
+                
+                # 將資料放入 SQL 佇列（如果啟用 SQL）
+                if sql_uploader_instance and sql_enabled:
+                    try:
+                        sql_data_queue.put(data.copy(), block=False)
+                    except queue.Full:
+                        warning("SQL 資料佇列已滿，跳過此筆資料")
 
                 data = daq_instance.get_data()
 
@@ -1120,6 +1041,189 @@ def collection_loop():
 
         except Exception as e:
             error(f"Data collection loop error: {e}")
+            time.sleep(0.1)
+
+
+def csv_writer_loop():
+    """
+    CSV 寫入迴圈（在獨立執行緒中執行）
+    
+    此函數負責：
+    1. 從 CSV 資料佇列讀取資料
+    2. 將資料寫入 CSV 檔案（自動分檔，確保樣本邊界）
+    3. 處理 CSV 分檔邏輯
+    
+    資料流程：
+        CSV 佇列 → csv_writer_loop → CSV 檔案
+    
+    注意：
+        - 此函數在背景執行緒中執行，不會阻塞其他執行緒
+        - 使用阻塞方式從佇列讀取資料，避免 CPU 空轉
+        - 確保切斷位置在樣本邊界（3的倍數），避免通道錯位
+    """
+    global is_collecting, csv_writer_instance, sql_uploader_instance, sql_enabled
+    global target_size, current_data_size, csv_data_queue
+    
+    channels = 3
+    
+    while is_collecting or not csv_data_queue.empty():
+        try:
+            # 從佇列讀取資料（阻塞等待，最多等待 1 秒）
+            try:
+                data = csv_data_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            
+            data_size = len(data)
+            current_data_size += data_size
+
+            if current_data_size < target_size:
+                csv_writer_instance.add_data_block(data)
+            else:
+                data_actual_size = data_size
+                empty_space = target_size - (current_data_size - data_actual_size)
+                empty_space = (empty_space // channels) * channels
+
+                while current_data_size >= target_size:
+                    batch = data[:empty_space]
+                    csv_writer_instance.add_data_block(batch)
+                    csv_writer_instance.update_filename()
+                    
+                    # 通知 SQL 執行緒建立對應的資料表
+                    if sql_uploader_instance and sql_enabled:
+                        csv_filename = csv_writer_instance.get_current_filename() if csv_writer_instance else None
+                        if csv_filename:
+                            if sql_uploader_instance.create_table(csv_filename):
+                                info(f"SQL 表已建立，對應 CSV: {csv_filename}")
+                            else:
+                                warning(f"SQL 表建立失敗，對應 CSV: {csv_filename}")
+
+                    current_data_size -= target_size
+                    
+                    if empty_space < data_actual_size:
+                        data = data[empty_space:]
+                        data_actual_size = len(data)
+                        empty_space = target_size
+                        empty_space = (empty_space // channels) * channels
+                    else:
+                        break
+
+                pending = data_actual_size
+                if pending:
+                    csv_writer_instance.add_data_block(data)
+                    current_data_size = pending
+                else:
+                    current_data_size = 0
+            
+            csv_data_queue.task_done()
+
+        except Exception as e:
+            error(f"CSV writer loop error: {e}")
+            time.sleep(0.1)
+
+
+def sql_writer_loop():
+    """
+    SQL 寫入迴圈（在獨立執行緒中執行）
+    
+    此函數負責：
+    1. 從 SQL 資料佇列讀取資料
+    2. 將資料寫入 SQL 暫存檔案
+    3. 處理 SQL 上傳邏輯（定時上傳）
+    
+    資料流程：
+        SQL 佇列 → sql_writer_loop → SQL 暫存檔案 → SQL 伺服器
+    
+    注意：
+        - 此函數在背景執行緒中執行，不會阻塞其他執行緒
+        - 使用阻塞方式從佇列讀取資料，避免 CPU 空轉
+        - 確保寫入的資料量不超過目標值
+        - 定時檢查並上傳暫存檔案
+    """
+    global is_collecting, sql_uploader_instance, sql_enabled, sql_current_temp_file
+    global sql_target_size, sql_current_data_size, sql_sample_count, sql_start_time
+    global sql_data_queue, csv_writer_instance, daq_instance
+    
+    channels = 3
+    
+    # 取得取樣率
+    sample_rate = 7812  # 預設值
+    if csv_writer_instance:
+        sample_rate = csv_writer_instance.sample_rate
+    elif daq_instance:
+        try:
+            sample_rate = daq_instance.get_sample_rate()
+        except:
+            pass
+    
+    # 初始化 SQL 樣本計數和起始時間
+    if sql_start_time is None:
+        sql_start_time = datetime.now()
+        sql_sample_count = 0
+        sql_current_data_size = 0
+
+    while is_collecting or not sql_data_queue.empty():
+        try:
+            # 從佇列讀取資料（阻塞等待，最多等待 1 秒）
+            try:
+                sql_data = sql_data_queue.get(timeout=1.0)
+            except queue.Empty:
+                # 檢查是否需要上傳暫存檔案
+                if sql_current_data_size > 0:
+                    _upload_temp_file_if_needed()
+                continue
+            
+            if not sql_current_temp_file:
+                continue
+            
+            # 處理資料寫入，確保不超過目標值
+            remaining_data = sql_data
+            
+            while len(remaining_data) > 0:
+                # 計算當前檔案的剩餘空間
+                remaining_space = sql_target_size - sql_current_data_size
+                
+                if remaining_space <= 0:
+                    # 當前檔案已滿，先上傳
+                    if not _upload_temp_file_if_needed():
+                        # 上傳失敗，將剩餘資料寫入當前檔案（避免資料遺失）
+                        sql_sample_count = _write_to_temp_file(remaining_data, sample_rate, sql_start_time, sql_sample_count)
+                        sql_current_data_size += len(remaining_data)
+                        break
+                    # 上傳成功，重新計算剩餘空間
+                    remaining_space = sql_target_size - sql_current_data_size
+                
+                # 計算可以寫入的資料量（確保是 channels 的倍數）
+                write_size = min(len(remaining_data), remaining_space)
+                write_size = (write_size // channels) * channels
+                
+                if write_size > 0:
+                    # 寫入部分資料到當前檔案
+                    data_to_write = remaining_data[:write_size]
+                    sql_sample_count = _write_to_temp_file(data_to_write, sample_rate, sql_start_time, sql_sample_count)
+                    sql_current_data_size += write_size
+                    
+                    # 更新剩餘資料
+                    remaining_data = remaining_data[write_size:]
+                    
+                    # 檢查當前檔案是否已滿
+                    if sql_current_data_size >= sql_target_size:
+                        if not _upload_temp_file_if_needed():
+                            # 上傳失敗，跳出迴圈
+                            break
+                else:
+                    # 剩餘空間不足一個完整樣本，先上傳
+                    if not _upload_temp_file_if_needed():
+                        # 上傳失敗，將剩餘資料寫入當前檔案（避免資料遺失）
+                        sql_sample_count = _write_to_temp_file(remaining_data, sample_rate, sql_start_time, sql_sample_count)
+                        sql_current_data_size += len(remaining_data)
+                        break
+                    # 上傳成功，繼續處理剩餘資料
+            
+            sql_data_queue.task_done()
+
+        except Exception as e:
+            error(f"SQL writer loop error: {e}")
             time.sleep(0.1)
 
 
