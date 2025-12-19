@@ -874,7 +874,10 @@ collection_loop() [背景執行緒]
     │       - 每 200ms 更新一次
     │       - 限制顯示最近 10 秒的資料（78,120 個資料點/通道）
     │
-    ├─→ CSV Writer
+    ├─→ CSV 資料佇列 (csv_data_queue)
+    │   │
+    │   ▼
+    │   CSV Writer Thread (獨立執行緒)
     │   │
     │   ▼
     │   分檔邏輯判斷
@@ -891,19 +894,22 @@ collection_loop() [背景執行緒]
     │       CSV 檔案
     │       output/ProWaveDAQ/{timestamp}_{label}/{timestamp}_{label}_{001-999}.csv
     │
-    └─→ SQL Uploader
+    └─→ SQL 資料佇列 (sql_data_queue)
         │
         ▼
-    資料緩衝區 (sql_data_buffer)
+        SQL Writer Thread (獨立執行緒)
+        │
+        ▼
+        SQL 暫存檔案寫入
         │
         ├─→ sql_current_data_size < sql_target_size
         │   └─→ 累積資料，不上傳
         │
         └─→ sql_current_data_size >= sql_target_size
-            ├─→ 批次上傳 (executemany)
+            ├─→ 定時上傳 (executemany)
             ├─→ 重試機制 (最多 3 次)
             ├─→ 失敗保留 (資料不遺失)
-            └─→ 成功後從緩衝區移除
+            └─→ 成功後刪除暫存檔案
                 │
                 ▼
             MariaDB/MySQL 資料庫
@@ -999,6 +1005,25 @@ collection_loop() [背景執行緒]
 如有問題或建議，請聯絡專案維護者。
 
 ## 更新日誌
+
+### Version 6.0.0
+- **重大更新**：執行緒架構重構
+  - 將 CSV 和 SQL 寫入分離到獨立執行緒
+  - 建立 5 個獨立執行緒：Flask Thread、DAQ Reading Thread、Collection Thread、CSV Writer Thread、SQL Writer Thread
+  - 使用 `queue.Queue` 進行執行緒間通訊，確保執行緒安全
+  - 每個組件都在獨立的執行緒中運行，不會互相阻塞
+  - 資料流程：DAQ → Collection Thread → CSV/SQL 佇列 → 各自的寫入執行緒
+- **改進**：前端顯示優化
+  - 顯示最近 10 秒的資料（78,120 個資料點/通道）
+  - 不使用抽樣，繪製所有資料點以保持波形完整性
+  - 更新頻率：每 200ms 更新一次
+  - 資料點數顯示即時更新
+- **改進**：後端緩衝區優化
+  - 緩衝區大小：10 秒的資料量（234,360 個資料點）
+  - 保留最近 10 秒的資料供前端顯示
+- **新增**：執行緒同步機制
+  - 使用 `queue.Queue` 進行執行緒間通訊（執行緒安全）
+  - 停止時等待所有佇列處理完成，確保資料不遺失
 
 ### Version 5.0.0
 - **重大更新**：移除 Master.ini，改用 csv.ini 和 sql.ini
@@ -1164,4 +1189,4 @@ collection_loop() [背景執行緒]
 
 **最後更新**：2025年12月19日
 **作者**：王建葦  
-**當前版本**：5.0.0
+**當前版本**：6.0.0
