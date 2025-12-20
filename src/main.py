@@ -4,7 +4,7 @@
 ProWaveDAQ 即時資料可視化系統 - 主控制程式
 整合 DAQ、Web、CSV、SQL 四者運作
 
-版本：6.0.0
+版本：6.0.1
 """
 
 import os
