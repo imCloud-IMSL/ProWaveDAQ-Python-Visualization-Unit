@@ -313,17 +313,22 @@
                 .then(response => response.json())
                 .then(data => {
                     if (data.success && data.data && data.data.length > 0) {
-                        // 將資料按通道分組（假設每3個資料點為一組：通道1、通道2、通道3）
+                        // 確保資料點數是3的倍數（完整樣本）
+                        const CHANNELS = 3;
+                        const completeSamples = Math.floor(data.data.length / CHANNELS);
+                        const trimmedData = data.data.slice(0, completeSamples * CHANNELS);
+
+                        // 將資料按通道分組（每3個資料點為一組：通道1、通道2、通道3）
                         const channel1 = [];
                         const channel2 = [];
                         const channel3 = [];
                         const labels = [];
 
-                        for (let i = 0; i < data.data.length; i += 3) {
-                            if (i < data.data.length) channel1.push(data.data[i]);
-                            if (i + 1 < data.data.length) channel2.push(data.data[i + 1]);
-                            if (i + 2 < data.data.length) channel3.push(data.data[i + 2]);
-                            labels.push(i / 3);
+                        for (let i = 0; i < trimmedData.length; i += CHANNELS) {
+                            channel1.push(trimmedData[i]);
+                            channel2.push(trimmedData[i + 1]);
+                            channel3.push(trimmedData[i + 2]);
+                            labels.push(i / CHANNELS);
                         }
 
                         // 更新圖表（不斷延伸，不重繪）
@@ -332,13 +337,14 @@
                         chart.data.datasets[1].data = channel2;
                         chart.data.datasets[2].data = channel3;
 
-                        // 限制資料點數量以保持效能（保留最近10秒的資料，7812 Hz × 10 秒 = 78120 個點）
-                        const maxPoints = 78120; // 10 秒的資料點數
-                        if (chart.data.labels.length > maxPoints) {
-                            chart.data.labels = chart.data.labels.slice(-maxPoints);
-                            chart.data.datasets[0].data = chart.data.datasets[0].data.slice(-maxPoints);
-                            chart.data.datasets[1].data = chart.data.datasets[1].data.slice(-maxPoints);
-                            chart.data.datasets[2].data = chart.data.datasets[2].data.slice(-maxPoints);
+                        // 限制資料點數量以保持效能（保留最近10秒的資料）
+                        // 7812 Hz × 10 秒 = 78120 個樣本（每個樣本包含3個通道）
+                        const maxSamples = 78120; // 10 秒的樣本數
+                        if (chart.data.labels.length > maxSamples) {
+                            chart.data.labels = chart.data.labels.slice(-maxSamples);
+                            chart.data.datasets[0].data = chart.data.datasets[0].data.slice(-maxSamples);
+                            chart.data.datasets[1].data = chart.data.datasets[1].data.slice(-maxSamples);
+                            chart.data.datasets[2].data = chart.data.datasets[2].data.slice(-maxSamples);
                         }
 
                         chart.update('none'); // 'none' 模式以提升效能
