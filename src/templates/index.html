@@ -5,9 +5,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ProWaveDAQ 即時資料可視化系統</title>
-    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='imCloud.jpg') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
     <style>
+        /* --- CSS 樣式保持不變 --- */
         body {
             font-family: Arial, sans-serif;
             margin: 20px;
@@ -51,18 +51,12 @@
         }
 
         input[type="text"],
-        textarea {
+        input[type="password"] {
             width: 100%;
             padding: 8px;
             border: 1px solid #ddd;
             border-radius: 4px;
             box-sizing: border-box;
-        }
-
-        textarea {
-            min-height: 100px;
-            font-family: monospace;
-            font-size: 12px;
         }
 
         button {
@@ -90,15 +84,6 @@
 
         .btn-stop:hover {
             background-color: #da190b;
-        }
-
-        .btn-save {
-            background-color: #2196F3;
-            color: white;
-        }
-
-        .btn-save:hover {
-            background-color: #0b7dda;
         }
 
         .btn:disabled {
@@ -223,7 +208,7 @@
             </div>
             <div class="info" id="infoArea">
                 <strong>狀態：</strong><span id="statusText">待機中</span><br>
-                <strong>資料點數：</strong><span id="dataCount">0</span>
+                <strong>資料點數 (Total): </strong><span id="dataCount">0</span>
             </div>
         </div>
 
@@ -246,43 +231,45 @@
     </div>
 
     <script>
+        // === 全域變數 ===
         let chart = null;
         let dataUpdateInterval = null;
         let isCollecting = false;
-        let sampleRate = 7812; // 預設取樣率
-        let startTime = null; // 起始時間
-        let totalSamplesDisplayed = 0; // 已顯示的樣本總數（用於計算真實時間）
 
-        // 初始化 Chart.js
+        // 核心參數：圖表上最多保留幾個點 (視窗大小)
+        // 配合後端降頻，500 點大約是 5-10 秒的資料量，保證流暢
+        const MAX_CHART_POINTS = 500;
+
+        // === 初始化圖表 ===
         function initChart() {
             const ctx = document.getElementById('realtimeChart').getContext('2d');
             chart = new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: [],
+                    labels: [], // 時間或索引標籤
                     datasets: [
                         {
-                            label: '通道 1',
+                            label: '通道 1 (X)',
                             data: [],
                             borderColor: 'rgb(255, 99, 132)',
-                            backgroundColor: 'rgba(255, 99, 132, 0.1)',
-                            tension: 0.1,
-                            pointRadius: 0
+                            borderWidth: 1.5,
+                            tension: 0,        // 設為 0 提升繪圖效能
+                            pointRadius: 0     // 不畫資料點圓圈，大幅提升效能
                         },
                         {
-                            label: '通道 2',
+                            label: '通道 2 (Y)',
                             data: [],
                             borderColor: 'rgb(54, 162, 235)',
-                            backgroundColor: 'rgba(54, 162, 235, 0.1)',
-                            tension: 0.1,
+                            borderWidth: 1.5,
+                            tension: 0,
                             pointRadius: 0
                         },
                         {
-                            label: '通道 3',
+                            label: '通道 3 (Z)',
                             data: [],
                             borderColor: 'rgb(75, 192, 192)',
-                            backgroundColor: 'rgba(75, 192, 192, 0.1)',
-                            tension: 0.1,
+                            borderWidth: 1.5,
+                            tension: 0,
                             pointRadius: 0
                         }
                     ]
@@ -290,199 +277,112 @@
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false, // 關鍵：關閉動畫以解決閃爍並提升即時性
+                    interaction: {
+                        mode: 'none',  // 關閉滑鼠互動提示，減少 CPU 消耗
+                        intersect: false
+                    },
                     scales: {
-                        y: {
-                            beginAtZero: false
-                        },
                         x: {
                             display: true,
-                            title: {
-                                display: true,
-                                text: '時間 (時:分:秒)'
-                            },
-                            ticks: {
-                                callback: function (value, index) {
-                                    // 根據樣本索引計算真實時間（時:分:秒格式）
-                                    // value 是圖表中的樣本索引（從0開始），需要加上已顯示的樣本總數
-                                    if (sampleRate > 0 && startTime) {
-                                        const totalSampleIndex = totalSamplesDisplayed + value;
-                                        const seconds = totalSampleIndex / sampleRate;
-                                        const sampleTime = new Date(startTime.getTime() + seconds * 1000);
-                                        const hours = sampleTime.getHours();
-                                        const minutes = sampleTime.getMinutes();
-                                        const secs = sampleTime.getSeconds();
-                                        return hours + ':' + (minutes < 10 ? '0' : '') + minutes + ':' + (secs < 10 ? '0' : '') + secs;
-                                    }
-                                    return value;
-                                },
-                                maxTicksLimit: 10 // 限制標籤數量以保持清晰
-                            }
+                            title: { display: true, text: '時間軸 (最新資料在右側)' },
+                            ticks: { display: false } // 隱藏 X 軸文字以保持乾淨
+                        },
+                        y: {
+                            beginAtZero: false
                         }
-                    },
-                    plugins: {
-                        legend: {
-                            display: true
-                        }
-                    },
-                    animation: {
-                        duration: 0
                     }
                 }
             });
         }
 
-        // 更新圖表資料
+        // === 更新圖表核心邏輯 ===
         function updateChart() {
             fetch('/data')
                 .then(response => response.json())
-                .then(data => {
-                    // 更新取樣率和起始時間
-                    if (data.sample_rate) {
-                        sampleRate = data.sample_rate;
-                    }
-                    if (data.start_time) {
-                        const newStartTime = new Date(data.start_time);
-                        // 如果起始時間改變（新的收集開始），重置樣本計數
-                        if (!startTime || newStartTime.getTime() !== startTime.getTime()) {
-                            startTime = newStartTime;
-                            totalSamplesDisplayed = 0;
+                .then(res => {
+                    // 1. 檢查後端狀態
+                    // 如果後端說停止了，且沒有新資料，強制前端 UI 同步停止
+                    if (!res.is_collecting && (!res.data || res.data.length === 0)) {
+                        if (isCollecting) {
+                            stopUI();
                         }
+                        return;
                     }
 
-                    if (data.success && data.data && data.data.length > 0) {
-                        // 確保資料點數是3的倍數（完整樣本）
+                    // 2. 處理資料 (增量更新)
+                    if (res.data && res.data.length > 0) {
                         const CHANNELS = 3;
-                        const completeSamples = Math.floor(data.data.length / CHANNELS);
-                        const trimmedData = data.data.slice(0, completeSamples * CHANNELS);
+                        const newData = res.data;
 
-                        // 將資料按通道分組（每3個資料點為一組：通道1、通道2、通道3）
-                        const channel1 = [];
-                        const channel2 = [];
-                        const channel3 = [];
-                        const labels = [];
-
-                        for (let i = 0; i < trimmedData.length; i += CHANNELS) {
-                            channel1.push(trimmedData[i]);
-                            channel2.push(trimmedData[i + 1]);
-                            channel3.push(trimmedData[i + 2]);
-                            // 使用樣本索引作為標籤（X 軸會自動轉換為時間）
-                            labels.push(i / CHANNELS);
+                        // 資料結構是 [x1, y1, z1, x2, y2, z2...]
+                        for (let i = 0; i < newData.length; i += CHANNELS) {
+                            // 確保資料完整
+                            if (i + 2 < newData.length) {
+                                // 加到右側 (Push)
+                                chart.data.labels.push(''); // 使用空標籤
+                                chart.data.datasets[0].data.push(newData[i]);
+                                chart.data.datasets[1].data.push(newData[i + 1]);
+                                chart.data.datasets[2].data.push(newData[i + 2]);
+                            }
                         }
 
-                        // 檢查是否有新資料（資料長度增加）
-                        const previousDataLength = chart.data.labels.length;
-                        const newDataLength = labels.length;
-
-                        // 判斷是否為新的收集（資料長度大幅減少或第一個樣本不同）
-                        const isNewCollection = newDataLength < previousDataLength * 0.5 ||
-                            (previousDataLength > 0 && newDataLength > 0 &&
-                                (channel1[0] !== chart.data.datasets[0].data[0] ||
-                                    Math.abs(channel1[0] - chart.data.datasets[0].data[0]) > 0.1));
-
-                        if (isNewCollection) {
-                            // 新的收集開始，重置圖表和樣本計數
-                            chart.data.labels = labels;
-                            chart.data.datasets[0].data = channel1;
-                            chart.data.datasets[1].data = channel2;
-                            chart.data.datasets[2].data = channel3;
-                            totalSamplesDisplayed = 0;
-                        } else if (newDataLength > previousDataLength) {
-                            // 有新資料，追加到現有資料
-                            chart.data.labels.push(...labels.slice(previousDataLength));
-                            chart.data.datasets[0].data.push(...channel1.slice(previousDataLength));
-                            chart.data.datasets[1].data.push(...channel2.slice(previousDataLength));
-                            chart.data.datasets[2].data.push(...channel3.slice(previousDataLength));
-                        } else if (newDataLength < previousDataLength) {
-                            // 資料被截斷（超過10秒），更新圖表和樣本計數
-                            const removedSamples = previousDataLength - newDataLength;
-                            totalSamplesDisplayed += removedSamples;
-                            chart.data.labels = labels;
-                            chart.data.datasets[0].data = channel1;
-                            chart.data.datasets[1].data = channel2;
-                            chart.data.datasets[2].data = channel3;
-                        } else {
-                            // 資料長度相同，直接更新
-                            chart.data.labels = labels;
-                            chart.data.datasets[0].data = channel1;
-                            chart.data.datasets[1].data = channel2;
-                            chart.data.datasets[2].data = channel3;
+                        // 3. 維持視窗大小 (Shift 移除左側舊資料)
+                        const currentLength = chart.data.labels.length;
+                        if (currentLength > MAX_CHART_POINTS) {
+                            const removeCount = currentLength - MAX_CHART_POINTS;
+                            chart.data.labels.splice(0, removeCount);
+                            chart.data.datasets[0].data.splice(0, removeCount);
+                            chart.data.datasets[1].data.splice(0, removeCount);
+                            chart.data.datasets[2].data.splice(0, removeCount);
                         }
 
-                        // 更新圖表（使用 'none' 模式以提升效能）
-                        // 注意：即使資料沒有變化，時間標籤也會更新（因為時間在持續變化）
-                        chart.update('none');
+                        // 4. 更新畫面
+                        chart.update();
 
-                        // 更新資料點數顯示（使用實際顯示的資料點數）
-                        document.getElementById('dataCount').textContent = data.counter || 0;
-                    }
-                })
-                .catch(error => {
-                    console.error('更新資料時發生錯誤:', error);
-                });
-        }
-
-        let sqlConfigFromIni = null;
-
-        // 載入 SQL 設定（從 INI 檔案）
-        function loadSqlConfig() {
-            fetch('/sql_config')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success && data.sql_config) {
-                        sqlConfigFromIni = data.sql_config;
-                        updateSqlIniInfo();
-
-                        // 如果 INI 設定啟用 SQL，自動勾選
-                        if (sqlConfigFromIni.enabled) {
-                            document.getElementById('sqlEnabled').checked = true;
-                            toggleSqlSettings();
+                        // 5. 更新計數器
+                        if (res.counter) {
+                            document.getElementById('dataCount').textContent = res.counter;
                         }
                     }
                 })
                 .catch(error => {
-                    console.error('載入 SQL 設定時發生錯誤:', error);
+                    console.error('更新資料錯誤:', error);
                 });
         }
 
-        // 更新 INI 設定顯示
-        function updateSqlIniInfo() {
-            if (!sqlConfigFromIni) return;
+        // === UI 狀態控制：開始 ===
+        function startUI() {
+            isCollecting = true;
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+            document.getElementById('labelInput').disabled = true;
+            document.getElementById('statusText').textContent = '採集中...';
 
-            const infoText = document.getElementById('sqlIniConfigText');
-            if (sqlConfigFromIni.enabled) {
-                infoText.innerHTML = `已啟用 | ${sqlConfigFromIni.host}:${sqlConfigFromIni.port} | 使用者: ${sqlConfigFromIni.user} | 資料庫: ${sqlConfigFromIni.database}`;
-            } else {
-                infoText.innerHTML = '未啟用（可在 INI 檔案中設定 enabled = true）';
+            // 清空舊圖表
+            chart.data.labels = [];
+            chart.data.datasets.forEach(ds => ds.data = []);
+            chart.update();
+
+            // 啟動 Timer (每 100ms 更新一次)
+            if (dataUpdateInterval) clearInterval(dataUpdateInterval);
+            dataUpdateInterval = setInterval(updateChart, 100);
+        }
+
+        // === UI 狀態控制：停止 ===
+        function stopUI() {
+            isCollecting = false;
+            if (dataUpdateInterval) {
+                clearInterval(dataUpdateInterval);
+                dataUpdateInterval = null;
             }
-
-            // 將 INI 設定值填入手動輸入欄位作為預設值
-            if (sqlConfigFromIni) {
-                document.getElementById('sqlHost').value = sqlConfigFromIni.host || 'localhost';
-                document.getElementById('sqlPort').value = sqlConfigFromIni.port || '3306';
-                document.getElementById('sqlUser').value = sqlConfigFromIni.user || 'root';
-                document.getElementById('sqlPassword').value = sqlConfigFromIni.password || '';
-                document.getElementById('sqlDatabase').value = sqlConfigFromIni.database || 'prowavedaq';
-            }
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('labelInput').disabled = false;
+            document.getElementById('statusText').textContent = '已停止';
         }
 
-        // 切換 SQL 設定顯示
-        function toggleSqlSettings() {
-            const sqlEnabled = document.getElementById('sqlEnabled').checked;
-            const sqlSettings = document.getElementById('sqlSettings');
-            sqlSettings.style.display = sqlEnabled ? 'block' : 'none';
-        }
-
-        // 切換 SQL 設定模式（INI 或手動）
-        function toggleSqlConfigMode() {
-            const useIni = document.getElementById('sqlUseIni').checked;
-            const iniInfo = document.getElementById('sqlIniInfo');
-            const manualSettings = document.getElementById('sqlManualSettings');
-
-            iniInfo.style.display = useIni ? 'block' : 'none';
-            manualSettings.style.display = useIni ? 'none' : 'block';
-        }
-
-        // 開始收集資料
+        // === 開始按鈕事件 ===
         function startCollection() {
             const label = document.getElementById('labelInput').value.trim();
             if (!label) {
@@ -490,139 +390,129 @@
                 return;
             }
 
+            // 準備參數
             const csvEnabled = document.getElementById('csvEnabled').checked;
             const sqlEnabled = document.getElementById('sqlEnabled').checked;
-            const requestData = {
-                label: label,
-                csv_enabled: csvEnabled
-            };
+            const requestData = { label: label, csv_enabled: csvEnabled };
 
-            // 如果啟用 SQL，根據模式決定是否傳送設定
+            // SQL 參數處理
             if (sqlEnabled) {
                 const useIni = document.getElementById('sqlUseIni').checked;
-
-                if (useIni) {
-                    // 使用 INI 設定：只傳送 sql_enabled，讓後端使用 INI 設定
-                    requestData.sql_enabled = true;
-                } else {
-                    // 手動輸入：傳送所有設定（覆蓋 INI 設定）
-                    requestData.sql_enabled = true;
-                    requestData.sql_host = document.getElementById('sqlHost').value.trim() || 'localhost';
-                    requestData.sql_port = document.getElementById('sqlPort').value.trim() || '3306';
-                    requestData.sql_user = document.getElementById('sqlUser').value.trim() || 'root';
+                requestData.sql_enabled = true;
+                if (!useIni) {
+                    requestData.sql_host = document.getElementById('sqlHost').value.trim();
+                    requestData.sql_port = document.getElementById('sqlPort').value.trim();
+                    requestData.sql_user = document.getElementById('sqlUser').value.trim();
                     requestData.sql_password = document.getElementById('sqlPassword').value;
-                    requestData.sql_database = document.getElementById('sqlDatabase').value.trim() || 'prowavedaq';
+                    requestData.sql_database = document.getElementById('sqlDatabase').value.trim();
                 }
             } else {
-                // 未啟用 SQL
                 requestData.sql_enabled = false;
             }
 
             fetch('/start', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(requestData)
             })
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
-                        isCollecting = true;
-                        startTime = null; // 重置起始時間，等待 API 返回
-                        totalSamplesDisplayed = 0; // 重置樣本計數
-                        document.getElementById('startBtn').disabled = true;
-                        document.getElementById('stopBtn').disabled = false;
-                        document.getElementById('labelInput').disabled = true;
-                        document.getElementById('statusText').textContent = '採集中...';
+                        startUI(); // 更新 UI
                         showStatus('資料收集已開始', 'success');
-
-                        // 開始每 100ms 更新圖表（提高更新頻率以改善即時性）
-                        if (dataUpdateInterval) clearInterval(dataUpdateInterval);
-                        dataUpdateInterval = setInterval(updateChart, 100);
                     } else {
                         showStatus('啟動失敗: ' + (data.message || '未知錯誤'), 'error');
                     }
                 })
-                .catch(error => {
-                    showStatus('啟動時發生錯誤: ' + error, 'error');
-                });
+                .catch(error => showStatus('啟動錯誤: ' + error, 'error'));
         }
 
-        // 停止收集資料
+        // === 停止按鈕事件 ===
         function stopCollection() {
-            fetch('/stop', {
-                method: 'POST'
-            })
+            // 1. 立即停止 UI (解決延遲問題)
+            stopUI();
+            showStatus('停止指令已發送...', 'info');
+
+            // 2. 發送停止請求給後端
+            fetch('/stop', { method: 'POST' })
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
-                        isCollecting = false;
-                        startTime = null; // 重置起始時間
-                        totalSamplesDisplayed = 0; // 重置樣本計數
-                        document.getElementById('startBtn').disabled = false;
-                        document.getElementById('stopBtn').disabled = true;
-                        document.getElementById('labelInput').disabled = false;
-                        document.getElementById('statusText').textContent = '已停止';
-                        showStatus('資料收集已停止', 'info');
-
-                        // 停止更新圖表
-                        if (dataUpdateInterval) {
-                            clearInterval(dataUpdateInterval);
-                            dataUpdateInterval = null;
-                        }
+                        showStatus('後端已確認停止', 'success');
                     } else {
-                        showStatus('停止失敗: ' + (data.message || '未知錯誤'), 'error');
+                        showStatus('停止回應異常: ' + data.message, 'error');
                     }
                 })
                 .catch(error => {
-                    showStatus('停止時發生錯誤: ' + error, 'error');
+                    console.error("Stop error:", error);
+                    // 即使網路錯誤，UI 也已經停了，確保使用者體驗流暢
                 });
         }
 
-        // 顯示狀態訊息
+        // === 狀態訊息顯示 ===
         function showStatus(message, type) {
             const statusArea = document.getElementById('statusArea');
-            const statusClass = 'status-' + (type || 'info');
-            statusArea.innerHTML = '<div class="status ' + statusClass + '">' + message + '</div>';
-            setTimeout(() => {
-                statusArea.innerHTML = '';
-            }, 5000);
+            statusArea.innerHTML = `<div class="status status-${type || 'info'}">${message}</div>`;
+            setTimeout(() => { statusArea.innerHTML = ''; }, 5000);
         }
 
-        // 檢查並恢復收集狀態
-        function checkAndRestoreStatus() {
-            fetch('/status')
+        // === 輔助功能：SQL 設定與 INI ===
+        let sqlConfigFromIni = null;
+
+        function loadSqlConfig() {
+            fetch('/sql_config')
                 .then(response => response.json())
                 .then(data => {
-                    if (data.success && data.is_collecting) {
-                        // 如果後端正在收集資料，恢復前端狀態
-                        isCollecting = true;
-                        document.getElementById('startBtn').disabled = true;
-                        document.getElementById('stopBtn').disabled = false;
-                        document.getElementById('labelInput').disabled = true;
-                        document.getElementById('statusText').textContent = '採集中...';
-                        document.getElementById('dataCount').textContent = data.counter || 0;
-
-                        // 開始更新圖表（每 100ms 更新一次以改善即時性）
-                        if (dataUpdateInterval) clearInterval(dataUpdateInterval);
-                        dataUpdateInterval = setInterval(updateChart, 100);
+                    if (data.success && data.sql_config) {
+                        sqlConfigFromIni = data.sql_config;
+                        updateSqlIniInfo();
+                        if (sqlConfigFromIni.enabled) {
+                            document.getElementById('sqlEnabled').checked = true;
+                            toggleSqlSettings();
+                        }
                     }
-                })
-                .catch(error => {
-                    console.error('檢查狀態時發生錯誤:', error);
                 });
         }
 
-        // 初始化
+        function updateSqlIniInfo() {
+            const infoText = document.getElementById('sqlIniConfigText');
+            if (sqlConfigFromIni && sqlConfigFromIni.enabled) {
+                infoText.innerHTML = `已啟用 | ${sqlConfigFromIni.host}:${sqlConfigFromIni.port} | User: ${sqlConfigFromIni.user}`;
+                // 預填手動欄位
+                document.getElementById('sqlHost').value = sqlConfigFromIni.host;
+                document.getElementById('sqlPort').value = sqlConfigFromIni.port;
+                document.getElementById('sqlUser').value = sqlConfigFromIni.user;
+                document.getElementById('sqlDatabase').value = sqlConfigFromIni.database;
+            } else {
+                infoText.innerHTML = '未啟用 (INI 設定 enabled=false)';
+            }
+        }
+
+        function toggleSqlSettings() {
+            const enabled = document.getElementById('sqlEnabled').checked;
+            document.getElementById('sqlSettings').style.display = enabled ? 'block' : 'none';
+        }
+
+        function toggleSqlConfigMode() {
+            const useIni = document.getElementById('sqlUseIni').checked;
+            document.getElementById('sqlIniInfo').style.display = useIni ? 'block' : 'none';
+            document.getElementById('sqlManualSettings').style.display = useIni ? 'none' : 'block';
+        }
+
+        // === 頁面載入初始化 ===
         window.onload = function () {
             initChart();
-            // 載入 SQL 設定
             loadSqlConfig();
-            // 檢查並恢復狀態
-            checkAndRestoreStatus();
-            // 初始更新一次
-            updateChart();
+
+            // 檢查後端是否正在執行中 (例如頁面重整後)
+            fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success && data.is_collecting) {
+                        document.getElementById('dataCount').textContent = data.counter || 0;
+                        startUI(); // 恢復 UI 狀態
+                    }
+                });
         };
     </script>
 </body>

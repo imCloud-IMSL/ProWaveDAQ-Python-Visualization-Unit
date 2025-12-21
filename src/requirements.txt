@@ -18,6 +18,9 @@ Flask>=3.1.2
 pymysql>=1.0.2
 # mysql-connector-python>=8.0.33  # 可選，如果不想使用 pymysql
 
+# NumPy
+numpy>=2.4.0
+
 # 系統相關（通常已內建，不需要額外安裝）
 # configparser - Python 3.2+ 內建模組
 # threading - Python內建模組
