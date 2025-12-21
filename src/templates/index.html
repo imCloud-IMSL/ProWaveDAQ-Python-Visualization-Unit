@@ -249,6 +249,9 @@
         let chart = null;
         let dataUpdateInterval = null;
         let isCollecting = false;
+        let sampleRate = 7812; // 預設取樣率
+        let startTime = null; // 起始時間
+        let totalSamplesDisplayed = 0; // 已顯示的樣本總數（用於計算真實時間）
 
         // 初始化 Chart.js
         function initChart() {
@@ -292,7 +295,28 @@
                             beginAtZero: false
                         },
                         x: {
-                            display: false
+                            display: true,
+                            title: {
+                                display: true,
+                                text: '時間 (時:分:秒)'
+                            },
+                            ticks: {
+                                callback: function (value, index) {
+                                    // 根據樣本索引計算真實時間（時:分:秒格式）
+                                    // value 是圖表中的樣本索引（從0開始），需要加上已顯示的樣本總數
+                                    if (sampleRate > 0 && startTime) {
+                                        const totalSampleIndex = totalSamplesDisplayed + value;
+                                        const seconds = totalSampleIndex / sampleRate;
+                                        const sampleTime = new Date(startTime.getTime() + seconds * 1000);
+                                        const hours = sampleTime.getHours();
+                                        const minutes = sampleTime.getMinutes();
+                                        const secs = sampleTime.getSeconds();
+                                        return hours + ':' + (minutes < 10 ? '0' : '') + minutes + ':' + (secs < 10 ? '0' : '') + secs;
+                                    }
+                                    return value;
+                                },
+                                maxTicksLimit: 10 // 限制標籤數量以保持清晰
+                            }
                         }
                     },
                     plugins: {
@@ -312,6 +336,19 @@
             fetch('/data')
                 .then(response => response.json())
                 .then(data => {
+                    // 更新取樣率和起始時間
+                    if (data.sample_rate) {
+                        sampleRate = data.sample_rate;
+                    }
+                    if (data.start_time) {
+                        const newStartTime = new Date(data.start_time);
+                        // 如果起始時間改變（新的收集開始），重置樣本計數
+                        if (!startTime || newStartTime.getTime() !== startTime.getTime()) {
+                            startTime = newStartTime;
+                            totalSamplesDisplayed = 0;
+                        }
+                    }
+
                     if (data.success && data.data && data.data.length > 0) {
                         // 確保資料點數是3的倍數（完整樣本）
                         const CHANNELS = 3;
@@ -328,28 +365,54 @@
                             channel1.push(trimmedData[i]);
                             channel2.push(trimmedData[i + 1]);
                             channel3.push(trimmedData[i + 2]);
+                            // 使用樣本索引作為標籤（X 軸會自動轉換為時間）
                             labels.push(i / CHANNELS);
                         }
 
-                        // 更新圖表（不斷延伸，不重繪）
-                        chart.data.labels = labels;
-                        chart.data.datasets[0].data = channel1;
-                        chart.data.datasets[1].data = channel2;
-                        chart.data.datasets[2].data = channel3;
+                        // 檢查是否有新資料（資料長度增加）
+                        const previousDataLength = chart.data.labels.length;
+                        const newDataLength = labels.length;
 
-                        // 限制資料點數量以保持效能（保留最近10秒的資料）
-                        // 7812 Hz × 10 秒 = 78120 個樣本（每個樣本包含3個通道）
-                        const maxSamples = 78120; // 10 秒的樣本數
-                        if (chart.data.labels.length > maxSamples) {
-                            chart.data.labels = chart.data.labels.slice(-maxSamples);
-                            chart.data.datasets[0].data = chart.data.datasets[0].data.slice(-maxSamples);
-                            chart.data.datasets[1].data = chart.data.datasets[1].data.slice(-maxSamples);
-                            chart.data.datasets[2].data = chart.data.datasets[2].data.slice(-maxSamples);
+                        // 判斷是否為新的收集（資料長度大幅減少或第一個樣本不同）
+                        const isNewCollection = newDataLength < previousDataLength * 0.5 ||
+                            (previousDataLength > 0 && newDataLength > 0 &&
+                                (channel1[0] !== chart.data.datasets[0].data[0] ||
+                                    Math.abs(channel1[0] - chart.data.datasets[0].data[0]) > 0.1));
+
+                        if (isNewCollection) {
+                            // 新的收集開始，重置圖表和樣本計數
+                            chart.data.labels = labels;
+                            chart.data.datasets[0].data = channel1;
+                            chart.data.datasets[1].data = channel2;
+                            chart.data.datasets[2].data = channel3;
+                            totalSamplesDisplayed = 0;
+                        } else if (newDataLength > previousDataLength) {
+                            // 有新資料，追加到現有資料
+                            chart.data.labels.push(...labels.slice(previousDataLength));
+                            chart.data.datasets[0].data.push(...channel1.slice(previousDataLength));
+                            chart.data.datasets[1].data.push(...channel2.slice(previousDataLength));
+                            chart.data.datasets[2].data.push(...channel3.slice(previousDataLength));
+                        } else if (newDataLength < previousDataLength) {
+                            // 資料被截斷（超過10秒），更新圖表和樣本計數
+                            const removedSamples = previousDataLength - newDataLength;
+                            totalSamplesDisplayed += removedSamples;
+                            chart.data.labels = labels;
+                            chart.data.datasets[0].data = channel1;
+                            chart.data.datasets[1].data = channel2;
+                            chart.data.datasets[2].data = channel3;
+                        } else {
+                            // 資料長度相同，直接更新
+                            chart.data.labels = labels;
+                            chart.data.datasets[0].data = channel1;
+                            chart.data.datasets[1].data = channel2;
+                            chart.data.datasets[2].data = channel3;
                         }
 
-                        chart.update('none'); // 'none' 模式以提升效能
+                        // 更新圖表（使用 'none' 模式以提升效能）
+                        // 注意：即使資料沒有變化，時間標籤也會更新（因為時間在持續變化）
+                        chart.update('none');
 
-                        // 更新資料點數顯示
+                        // 更新資料點數顯示（使用實際顯示的資料點數）
                         document.getElementById('dataCount').textContent = data.counter || 0;
                     }
                 })
@@ -466,15 +529,17 @@
                 .then(data => {
                     if (data.success) {
                         isCollecting = true;
+                        startTime = null; // 重置起始時間，等待 API 返回
+                        totalSamplesDisplayed = 0; // 重置樣本計數
                         document.getElementById('startBtn').disabled = true;
                         document.getElementById('stopBtn').disabled = false;
                         document.getElementById('labelInput').disabled = true;
                         document.getElementById('statusText').textContent = '採集中...';
                         showStatus('資料收集已開始', 'success');
 
-                        // 開始每 200ms 更新圖表
+                        // 開始每 100ms 更新圖表（提高更新頻率以改善即時性）
                         if (dataUpdateInterval) clearInterval(dataUpdateInterval);
-                        dataUpdateInterval = setInterval(updateChart, 200);
+                        dataUpdateInterval = setInterval(updateChart, 100);
                     } else {
                         showStatus('啟動失敗: ' + (data.message || '未知錯誤'), 'error');
                     }
@@ -493,6 +558,8 @@
                 .then(data => {
                     if (data.success) {
                         isCollecting = false;
+                        startTime = null; // 重置起始時間
+                        totalSamplesDisplayed = 0; // 重置樣本計數
                         document.getElementById('startBtn').disabled = false;
                         document.getElementById('stopBtn').disabled = true;
                         document.getElementById('labelInput').disabled = false;
@@ -537,9 +604,9 @@
                         document.getElementById('statusText').textContent = '採集中...';
                         document.getElementById('dataCount').textContent = data.counter || 0;
 
-                        // 開始更新圖表
+                        // 開始更新圖表（每 100ms 更新一次以改善即時性）
                         if (dataUpdateInterval) clearInterval(dataUpdateInterval);
-                        dataUpdateInterval = setInterval(updateChart, 200);
+                        dataUpdateInterval = setInterval(updateChart, 100);
                     }
                 })
                 .catch(error => {

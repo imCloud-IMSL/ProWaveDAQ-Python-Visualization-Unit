@@ -51,6 +51,8 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
 realtime_data: List[float] = []
+realtime_data_buffer: List[float] = []  # 累積緩衝區，累積到1秒的量才更新到 realtime_data
+realtime_buffer_size = 0  # 緩衝區中的資料點數
 data_lock = threading.Lock()
 is_collecting = False
 collection_thread: Optional[threading.Thread] = None
@@ -77,6 +79,8 @@ sql_start_time: Optional[datetime] = None
 last_data_request_time = 0
 data_request_lock = threading.Lock()
 DATA_REQUEST_TIMEOUT = 5.0
+collection_start_time: Optional[datetime] = None  # 資料收集起始時間
+current_sample_rate: int = 7812  # 當前取樣率
 
 # 資料佇列（用於執行緒間通訊）
 csv_data_queue: "queue.Queue[List[float]]" = queue.Queue(maxsize=1000)
@@ -91,6 +95,7 @@ def update_realtime_data(data: List[float]) -> None:
     - 僅在有活躍前端連線時更新即時資料緩衝區，節省 CPU 和記憶體資源
     - 無活躍連線時跳過緩衝區更新，但計數器仍正常更新
     - 資料點計數器始終更新，用於狀態顯示
+    - 累積到1秒的資料量才一次性更新到 realtime_data，避免資料突然消失又出現
     - 限制緩衝區大小為 10 秒的資料量（7812 Hz × 3 通道 × 10 秒 = 234,360 個點）
 
     Args:
@@ -100,8 +105,10 @@ def update_realtime_data(data: List[float]) -> None:
         - 使用執行緒鎖確保資料一致性
         - 活躍連線判斷：5 秒內有 /data API 請求視為活躍
         - 緩衝區限制：保留最近 10 秒的資料（234,360 個資料點）
+        - 累積邏輯：資料先放入 realtime_data_buffer，當累積到1秒的量時才更新到 realtime_data
     """
-    global realtime_data, data_counter, last_data_request_time
+    global realtime_data, realtime_data_buffer, realtime_buffer_size
+    global data_counter, last_data_request_time, current_sample_rate
 
     with data_request_lock:
         has_active_connection = (
@@ -110,18 +117,33 @@ def update_realtime_data(data: List[float]) -> None:
 
     with data_lock:
         if has_active_connection:
-            realtime_data.extend(data)
-            # 限制緩衝區大小為 10 秒的資料量（7812 Hz × 3 通道 × 10 秒 = 234,360 個點）
-            # 確保截斷時保留完整的樣本（必須是3的倍數）
-            MAX_REALTIME_DATA_POINTS = 234360  # 10 秒的資料點數
+            # 將資料加入累積緩衝區
+            realtime_data_buffer.extend(data)
+            realtime_buffer_size += len(data)
+            
+            # 計算1秒的資料量（取樣率 × 通道數）
             CHANNELS = 3
-            if len(realtime_data) > MAX_REALTIME_DATA_POINTS:
-                # 只保留最近 10 秒的資料，確保是完整樣本（3的倍數）
-                excess = len(realtime_data) - MAX_REALTIME_DATA_POINTS
-                # 向上取整到最近的完整樣本邊界
-                excess_samples = (excess + CHANNELS - 1) // CHANNELS
-                trim_size = excess_samples * CHANNELS
-                realtime_data = realtime_data[trim_size:]
+            one_second_data_points = current_sample_rate * CHANNELS
+            
+            # 當累積到1秒的量時，一次性更新到 realtime_data
+            while realtime_buffer_size >= one_second_data_points:
+                # 取出1秒的資料（確保是完整樣本，必須是3的倍數）
+                data_to_add = realtime_data_buffer[:one_second_data_points]
+                realtime_data.extend(data_to_add)
+                
+                # 從緩衝區移除已添加的資料
+                realtime_data_buffer = realtime_data_buffer[one_second_data_points:]
+                realtime_buffer_size -= one_second_data_points
+                
+                # 限制緩衝區大小為 10 秒的資料量（7812 Hz × 3 通道 × 10 秒 = 234,360 個點）
+                MAX_REALTIME_DATA_POINTS = 234360  # 10 秒的資料點數
+                if len(realtime_data) > MAX_REALTIME_DATA_POINTS:
+                    # 只保留最近 10 秒的資料，確保是完整樣本（3的倍數）
+                    excess = len(realtime_data) - MAX_REALTIME_DATA_POINTS
+                    # 向上取整到最近的完整樣本邊界
+                    excess_samples = (excess + CHANNELS - 1) // CHANNELS
+                    trim_size = excess_samples * CHANNELS
+                    realtime_data = realtime_data[trim_size:]
         data_counter += len(data)
 
 
@@ -166,18 +188,36 @@ def get_data():
         - success: 是否成功
         - data: 即時資料列表，格式為 [X1, Y1, Z1, X2, Y2, Z2, ...]
         - counter: 資料點計數器（總資料點數）
+        - sample_rate: 取樣率（Hz）
+        - start_time: 資料收集起始時間（ISO 格式字串，如果正在收集中）
 
     注意：
         - 前端會將資料按每 3 個一組分離為 X, Y, Z 三個通道
         - 請求時間會用於智慧緩衝區更新機制
+        - start_time 用於計算每個樣本的時間戳
     """
-    global last_data_request_time
+    global last_data_request_time, collection_start_time, current_sample_rate
     with data_request_lock:
         last_data_request_time = time.time()
 
     data = get_realtime_data()
     global data_counter
-    return jsonify({"success": True, "data": data, "counter": data_counter})
+    
+    # 準備回應資料
+    # 使用 realtime_data 的實際長度作為顯示的資料點數，避免忽多忽少
+    response_data = {
+        "success": True,
+        "data": data,
+        "counter": len(data),  # 使用實際顯示的資料點數
+        "total_counter": data_counter,  # 總資料點數（用於調試或日誌）
+        "sample_rate": current_sample_rate,
+    }
+    
+    # 如果有起始時間，添加到回應中
+    if collection_start_time:
+        response_data["start_time"] = collection_start_time.isoformat()
+    
+    return jsonify(response_data)
 
 
 @app.route("/status")
@@ -452,6 +492,8 @@ def start_collection():
     global sql_upload_interval, sql_temp_dir, sql_current_temp_file
     global sql_start_time, sql_sample_count, last_data_request_time
     global csv_data_queue, sql_data_queue
+    global collection_start_time, current_sample_rate
+    global realtime_data_buffer, realtime_buffer_size
 
     if is_collecting:
         return jsonify({"success": False, "message": "資料收集已在執行中"})
@@ -466,6 +508,8 @@ def start_collection():
 
         with data_lock:
             realtime_data = []
+            realtime_data_buffer = []  # 重置累積緩衝區
+            realtime_buffer_size = 0  # 重置緩衝區大小
             data_counter = 0
             current_data_size = 0
             sql_current_data_size = 0
@@ -474,6 +518,7 @@ def start_collection():
             last_data_request_time = 0
             sql_sample_count = 0
             sql_start_time = None
+            collection_start_time = None  # 重置起始時間
 
         # 讀取 csv.ini 設定
         csv_ini_path = "API/csv.ini"
@@ -546,7 +591,11 @@ def start_collection():
         daq_instance = ProWaveDAQ()
         daq_instance.init_devices("API/ProWaveDAQ.ini")
         sample_rate = daq_instance.get_sample_rate()
+        current_sample_rate = sample_rate  # 更新全局取樣率
         channels = 3
+        
+        # 記錄資料收集起始時間
+        collection_start_time = datetime.now()
 
         expected_samples_per_second = sample_rate * channels
         target_size = save_unit * expected_samples_per_second
@@ -657,12 +706,14 @@ def stop_collection():
     global daq_instance, csv_writer_instance, sql_uploader_instance
     global current_data_size, sql_current_data_size, sql_enabled
     global sql_temp_dir, sql_current_temp_file
+    global collection_start_time
 
     if not is_collecting:
         return jsonify({"success": False, "message": "資料收集未在執行中"})
 
     try:
         is_collecting = False
+        collection_start_time = None  # 重置起始時間
 
         if daq_instance:
             daq_instance.stop_reading()
