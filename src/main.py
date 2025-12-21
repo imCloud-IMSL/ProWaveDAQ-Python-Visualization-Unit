@@ -14,7 +14,6 @@ import configparser
 import logging
 import argparse
 import csv
-import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict
 from flask import Flask, render_template, request, jsonify, send_from_directory

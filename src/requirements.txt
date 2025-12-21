@@ -3,37 +3,14 @@
 
 # Modbus通訊
 # pymodbus 3.11.3+ 支援 Python 3.8+
-pymodbus>=3.11.3
+pymodbus==3.11.3
 
 # 串列埠通訊（ModbusSerialClient需要）
 # pyserial 3.5+ 支援 Python 3.7+
-pyserial>=3.5
+pyserial==3.5
 
 # Web 伺服器（Flask）
 # Flask 3.1.2+ 支援 Python 3.7+
-Flask>=3.1.2
-
-# SQL 資料庫連線（MySQL/MariaDB）
-# pymysql 或 mysql-connector-python 二選一
-pymysql>=1.0.2
-# mysql-connector-python>=8.0.33  # 可選，如果不想使用 pymysql
-
-# NumPy
-numpy>=2.4.0
-
-# 系統相關（通常已內建，不需要額外安裝）
-# configparser - Python 3.2+ 內建模組
-# threading - Python內建模組
-# csv - Python內建模組
-# os - Python內建模組
-# time - Python內建模組
-# datetime - Python內建模組
-# glob - Python內建模組
-# re - Python內建模組
-# typing - Python 3.5+ 內建模組
-# queue - Python內建模組
-
-# 可選的額外功能套件（如需數值計算或數據分析）
-# numpy>=1.24.0  # 如果需要數值計算
-# matplotlib>=3.7.0  # 如果需要繪圖功能
-# pandas>=2.0.0  # 如果需要數據分析
+Flask==3.1.2
+# SQL 資料庫連線（MariaDB）
+pymysql==1.0.2

@@ -12,7 +12,6 @@ CSV 寫入器模組
 
 import os
 import csv
-import time
 from datetime import datetime, timedelta
 from typing import List
 
