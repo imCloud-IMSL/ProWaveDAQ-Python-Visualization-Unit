@@ -40,4 +40,3 @@ echo ""
 # 同時使用 tee 在終端機顯示
 source venv/bin/activate
 python src/main.py --port ${PORT} 2>&1 | tee ${LOG_FILE}
-

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ProWaveDAQ 即時資料可視化系統 - 主控制程式 (優化版)
+ProWaveDAQ 即時資料可視化系統 - 主控制程式
 整合 DAQ、Web、CSV、SQL 四者運作
-
-版本：7.0.0 (Fix: Remove Circular Buffer, Add Downsampling Queue)
 """
 
 import os
@@ -371,10 +369,11 @@ def start_collection():
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         folder = f"{timestamp}_{label}"
         output_path = os.path.join(PROJECT_ROOT, "output", "ProWaveDAQ", folder)
-        os.makedirs(output_path, exist_ok=True)
-
+        
         csv_writer_instance = None
         if csv_enabled:
+            # 只有在啟用 CSV 時才建立資料夾
+            os.makedirs(output_path, exist_ok=True)
             csv_writer_instance = CSVWriter(channels, output_path, label, sample_rate)
 
         sql_uploader_instance = None
@@ -384,6 +383,9 @@ def start_collection():
 
         if sql_enabled:
             try:
+                # 如果 CSV 未啟用但 SQL 啟用，也需要建立資料夾來存放 SQL 暫存檔
+                if not csv_enabled:
+                    os.makedirs(output_path, exist_ok=True)
                 sql_uploader_instance = SQLUploader(channels, label, sql_config)
                 sql_temp_dir = os.path.join(output_path, ".sql_temp")
                 os.makedirs(sql_temp_dir, exist_ok=True)

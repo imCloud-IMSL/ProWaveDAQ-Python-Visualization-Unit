@@ -7,14 +7,11 @@ CSV 寫入器模組
 - 自動分檔（根據資料量）
 - 精確的時間戳記計算（根據取樣率）
 - 確保分檔時時間戳記連續
-- 多通道資料寫入（預設 3 通道：X, Y, Z）
-
-版本：6.0.2
+- 多通道資料寫入（預設 3 通道：X, Y, Z)
 """
 
 import os
 import csv
-import time
 from datetime import datetime, timedelta
 from typing import List
 

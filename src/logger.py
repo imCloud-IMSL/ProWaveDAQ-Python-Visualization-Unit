@@ -23,14 +23,10 @@
     # 關閉 Debug 訊息
     from logger import Logger
     Logger.set_debug_enabled(False)
-
-版本：4.0.0
 """
 
 import sys
 from datetime import datetime
-from typing import Optional
-
 
 class Logger:
     """
