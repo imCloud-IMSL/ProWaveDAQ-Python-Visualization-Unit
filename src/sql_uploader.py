@@ -63,9 +63,9 @@ class SQLUploader:
                 return pymysql.connect(
                     host=self.sql_config.get('host', 'localhost'),
                     port=int(self.sql_config.get('port', 3306)),
-                    user=self.sql_config.get('user', 'root'),
-                    password=self.sql_config.get('password', ''),
-                    database=self.sql_config.get('database', 'prowavedaq'),
+                    user=self.sql_config.get('user', 'raspberrypi'),
+                    password=self.sql_config.get('password', 'Raspberry@Pi'),
+                    database=self.sql_config.get('database', 'daq-prowavedaq-data'),
                     charset='utf8mb4',
                     autocommit=False
                 )
@@ -73,9 +73,9 @@ class SQLUploader:
                 return mysql.connector.connect(
                     host=self.sql_config.get('host', 'localhost'),
                     port=int(self.sql_config.get('port', 3306)),
-                    user=self.sql_config.get('user', 'root'),
-                    password=self.sql_config.get('password', ''),
-                    database=self.sql_config.get('database', 'prowavedaq'),
+                    user=self.sql_config.get('user', 'raspberrypi'),
+                    password=self.sql_config.get('password', 'Raspberry@Pi'),
+                    database=self.sql_config.get('database', 'daq-prowavedaq-data'),
                     autocommit=False
                 )
         except Exception as e:
